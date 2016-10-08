@@ -1,0 +1,103 @@
+#!/bin/bash
+
+:<<'hopper-stack-notice'
+
+Copyright 2016 Hopper-Stack
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+hopper-stack-notice
+
+# +------------------------------------------+
+# | VERIFY                                   |
+# +------------------------------------------+
+source variables
+
+clear
+source admin-openrc.sh
+echo "Glance image"
+glance image-list
+echo -n " > "; read
+
+source admin-openrc.sh
+echo "Token issue - admin"
+openstack token issue
+echo -n " > "; read
+
+source $FIRSTTENANT-openrc.sh
+echo "Token issue - $FIRSTTENANT"
+openstack token issue
+echo -n " > "; read
+
+source admin-openrc.sh
+echo "Nova endpoints"
+nova endpoints
+echo -n " > "; read
+
+source admin-openrc.sh
+echo "Nova services"
+nova service-list
+echo -n " > "; read
+
+source admin-openrc.sh
+echo "Nova image"
+openstack image list
+echo -n " > "; read
+
+source admin-openrc.sh
+echo "Keystone endpoints"
+openstack endpoint list
+echo -n " > "; read
+
+source admin-openrc.sh
+echo "Neutron extentions"
+neutron ext-list
+echo -n " > "; read
+
+source admin-openrc.sh
+echo "Neutron agents"
+neutron agent-list
+echo -n " > "; read
+
+source $FIRSTTENANT-openrc.sh
+echo "Cinder volume"
+cinder create --name $FIRSTTENANT-volume1 1
+sleep 10
+cinder list
+CV=`cinder list | grep $FIRSTTENANT-volume1 | head -1 | awk '{print $2}'`
+cinder delete $CV
+echo -n " > "; read
+
+source $FIRSTTENANT-openrc.sh
+echo "Swift statistics"
+swift stat
+echo -n " > "; read
+
+source $FIRSTTENANT-openrc.sh
+echo "Swift container"
+swift upload $FIRSTTENANT-container verify-build
+swift list
+swift download $FIRSTTENANT-container verify-build
+swift delete $FIRSTTENANT-container verify-build
+swift delete $FIRSTTENANT-container 
+echo -n " > "; read
+
+source $FIRSTTENANT-openrc.sh
+echo "Ceilometer"
+IMAGE_ID=$(glance image-list | grep 'cirros' | awk '{ print $2 }' | head -1)
+glance image-download $IMAGE_ID > /tmp/cirros.img
+rm -f /tmp/cirros.img
+ceilometer meter-list
+
+echo
+

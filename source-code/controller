@@ -1,0 +1,1239 @@
+#!/bin/bash
+
+:<<'hopper-stack-notice'
+
+Copyright 2016 Hopper-Stack
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+hopper-stack-notice
+
+# +------------------------------------------+
+# | VARIABLES                                |
+# +------------------------------------------+
+source variables
+
+# +------------------------------------------+
+# | INITIAL                                  |
+# +------------------------------------------+
+tput setaf 2
+echo "<<< Initial >>>"
+tput setaf 7
+systemctl mask firewalld
+systemctl stop firewalld
+sed -i 's/enforcing/disabled/g' /etc/selinux/config
+echo 0 > /sys/fs/selinux/enforce
+
+# ntp
+yum install -y chrony
+cd /etc
+sed -i "s/^server/# server/g" chrony.conf
+echo "server $NTPSERVER iburst" >> chrony.conf
+systemctl enable chronyd.service
+systemctl restart chronyd.service
+chronyc sources
+cd
+
+# +------------------------------------------+
+# | PACKAGES                                 |
+# +------------------------------------------+
+tput setaf 2
+echo "<<< Packages >>>"
+tput setaf 7
+
+yum install -y http://rdo.fedorapeople.org/openstack-$RELEASE/rdo-release-$RELEASE.rpm
+yum install -y centos-release-openstack-$RELEASE
+
+yum remove -y MariaDB-shared
+yum remove -y MariaDB-common
+yum install -y mariadb mariadb-server MySQL-python
+
+yum install -y python-openstackclient
+yum install -y crudini
+
+yum install -y rabbitmq-server
+
+yum install -y openstack-keystone
+yum install -y httpd
+yum install -y mod_wsgi
+yum install -y memcached
+yum install -y python-memcached
+
+yum install -y openstack-glance 
+
+yum install -y openstack-nova-api
+yum install -y openstack-nova-conductor
+yum install -y openstack-nova-console
+yum install -y openstack-nova-novncproxy
+yum install -y openstack-nova-scheduler
+
+yum install -y openstack-neutron
+yum install -y openstack-neutron-ml2 
+yum install -y which
+
+yum install -y openstack-dashboard
+
+yum install -y openstack-cinder
+
+yum install -y openstack-swift-proxy
+yum install -y python-swiftclient
+yum install -y python-keystoneauth-token
+yum install -y python-keystonemiddleware
+yum install -y memcached
+
+yum install -y openstack-heat-api
+yum install -y openstack-heat-api-cfn
+yum install -y openstack-heat-engine
+
+yum install -y openstack-ceilometer-api
+yum install -y openstack-ceilometer-collector
+yum install -y openstack-ceilometer-notification
+yum install -y openstack-ceilometer-central
+yum install -y python-ceilometerclient
+yum install -y python-ceilometermiddleware
+
+yum install -y openstack-aodh-api
+yum install -y openstack-aodh-evaluator
+yum install -y openstack-aodh-notifier
+yum install -y openstack-aodh-listener
+yum install -y openstack-aodh-expirer
+yum install -y python-aodhclient
+
+yum install -y openstack-manila
+yum install -y python-manilaclient
+
+# +------------------------------------------+
+# | MARIADB                                  |
+# +------------------------------------------+
+tput setaf 2
+echo "<<< MariaDB >>>"
+tput setaf 7
+file=/etc/my.cnf.d/mariadb_openstack.cnf
+echo > $file
+crudini --set $file mysqld bind-address $CONTROLLER
+crudini --set $file mysqld default-storage-engine innodb
+crudini --set $file mysqld collation-server utf8_general_ci
+crudini --set $file mysqld init-connect \'"SET NAMES utf8"\'
+crudini --set $file mysqld character-set-server utf8
+crudini --set $file mysqld max_connections 5000
+echo "innodb_file_per_table" >> $file
+
+mkdir -p /etc/systemd/system/mariadb.service.d
+echo "[Service]" > /etc/systemd/system/mariadb.service.d/limits.conf
+echo "LimitNOFILE=10000" >> /etc/systemd/system/mariadb.service.d/limits.conf
+
+systemctl daemon-reload
+systemctl enable mariadb.service
+systemctl restart mariadb.service
+
+# database configuration
+mysql -u root <<EOF
+UPDATE mysql.user SET password=PASSWORD('${DBPASS}') where user='root';
+FLUSH PRIVILEGES;
+EOF
+
+# +------------------------------------------+
+# | RABBIT                                   |
+# +------------------------------------------+
+tput setaf 2
+echo "<<< Rabbit >>>"
+tput setaf 7
+systemctl enable rabbitmq-server.service
+systemctl restart rabbitmq-server.service
+rabbitmqctl add_user openstack $RABBIT_PASS
+rabbitmqctl set_permissions openstack ".*" ".*" ".*"
+
+# +------------------------------------------+
+# | KEYSTONE INSTALLATION                    |
+# +------------------------------------------+
+tput setaf 2
+echo "<<< Keystone >>>"
+tput setaf 7
+
+mysql -u root -p${DBPASS} <<EOF
+CREATE DATABASE keystone;
+GRANT ALL PRIVILEGES ON keystone.* TO 'keystone'@'localhost' IDENTIFIED BY '$SERVICE_PWD';
+GRANT ALL PRIVILEGES ON keystone.* TO 'keystone'@'%' IDENTIFIED BY '$SERVICE_PWD';
+GRANT ALL PRIVILEGES ON keystone.* TO 'keystone'@'${CONTROLLERHN}' IDENTIFIED BY '$SERVICE_PWD';
+GRANT ALL PRIVILEGES ON keystone.* TO 'keystone'@'${CONTROLLER}' IDENTIFIED BY '$SERVICE_PWD';
+FLUSH PRIVILEGES;
+EOF
+
+systemctl enable memcached.service
+systemctl restart memcached.service
+
+# /etc/keystone/keystone.conf
+file=/etc/keystone/keystone.conf
+crudini --set $file DEFAULT admin_token $ADMIN_TOKEN
+
+crudini --set $file database connection mysql+pymysql://keystone:$SERVICE_PWD@$CONTROLLERHN/keystone
+
+crudini --set $file token provider fernet 
+
+echo "Updating database ..."
+su -s /bin/sh -c "keystone-manage db_sync" keystone
+
+keystone-manage fernet_setup --keystone-user keystone --keystone-group keystone
+keystone-manage credential_setup --keystone-user keystone --keystone-group keystone
+
+keystone-manage bootstrap --bootstrap-password $ADMIN_PWD \
+  --bootstrap-admin-url http://$CONTROLLER:35357/v3/ \
+  --bootstrap-internal-url http://$CONTROLLER:35357/v3/ \
+  --bootstrap-public-url http://$CONTROLLER:5000/v3/ \
+  --bootstrap-region-id RegionOne
+
+# +------------------------------------------+
+# | HTTP                                     |
+# +------------------------------------------+
+tput setaf 2
+echo "<<< HTTP >>>"
+tput setaf 7
+file=/etc/httpd/conf/httpd.conf
+sed -i "0,/#ServerName www.example.com:80/s//ServerName $CONTROLLER/" ${file}
+
+ln -s /usr/share/keystone/wsgi-keystone.conf /etc/httpd/conf.d/
+
+systemctl enable httpd.service
+systemctl restart httpd.service
+
+# +------------------------------------------+
+# | KEYSTONE                                 |
+# +------------------------------------------+
+tput setaf 2
+echo "<<< Keystone configuration >>>"
+tput setaf 7
+
+# services entity and API endpoints
+export OS_TOKEN=$ADMIN_TOKEN
+export OS_URL=http://$CONTROLLERHN:35357/v3
+export OS_IDENTITY_API_VERSION=3
+
+openstack project create --domain default \
+   --description "Service Project" service
+
+openstack project create --domain default \
+   --description "$FIRSTTENANT Project" $FIRSTTENANT
+
+openstack user create --domain default \
+   --password $FIRSTTENPWD $FIRSTTENANT
+   sleep 1
+
+openstack role create user
+openstack role add --project $FIRSTTENANT --user $FIRSTTENANT user
+sleep 1
+
+# glance
+openstack user create --domain default \
+   --password $SERVICE_PWD glance
+
+openstack role add --project service --user glance admin
+
+openstack service create --name glance \
+   --description "OpenStack Image service" image
+
+openstack endpoint create --region RegionOne \
+   image public http://$CONTROLLERHN:9292
+
+openstack endpoint create --region RegionOne \
+   image internal http://$CONTROLLERHN:9292
+
+openstack endpoint create --region RegionOne \
+   image admin http://$CONTROLLERHN:9292
+   sleep 1
+
+# nova
+openstack user create --domain default \
+   --password $SERVICE_PWD nova
+
+openstack role add --project service --user nova admin
+
+openstack service create --name nova \
+   --description "OpenStack Compute" compute
+
+openstack endpoint create --region RegionOne \
+   compute public http://$CONTROLLERHN:8774/v2.1/%\(tenant_id\)s
+
+openstack endpoint create --region RegionOne \
+   compute internal http://$CONTROLLERHN:8774/v2.1/%\(tenant_id\)s
+
+openstack endpoint create --region RegionOne \
+   compute admin http://$CONTROLLERHN:8774/v2.1/%\(tenant_id\)s
+   sleep 1
+
+# neutron
+openstack user create --domain default \
+   --password $SERVICE_PWD neutron
+
+openstack role add --project service --user neutron admin
+
+openstack service create --name neutron \
+   --description "OpenStack Networking" network
+
+openstack endpoint create --region RegionOne \
+   network public http://$CONTROLLERHN:9696
+
+openstack endpoint create --region RegionOne \
+   network internal http://$CONTROLLERHN:9696
+
+openstack endpoint create --region RegionOne \
+   network admin http://$CONTROLLERHN:9696
+   sleep 1
+
+# cinder
+openstack user create --domain default \
+   --password $SERVICE_PWD cinder
+
+openstack role add --project service --user cinder admin
+
+openstack service create --name cinder \
+   --description "OpenStack Block Storage" volume
+
+openstack service create --name cinderv2 \
+   --description "OpenStack Block Storage" volumev2
+
+openstack endpoint create --region RegionOne \
+   volume public http://$CONTROLLERHN:8776/v1/%\(tenant_id\)s
+
+openstack endpoint create --region RegionOne \
+   volume internal http://$CONTROLLERHN:8776/v1/%\(tenant_id\)s
+
+openstack endpoint create --region RegionOne \
+   volume admin http://$CONTROLLERHN:8776/v1/%\(tenant_id\)s
+   sleep 1
+
+openstack endpoint create --region RegionOne \
+   volumev2 public http://$CONTROLLERHN:8776/v2/%\(tenant_id\)s
+
+openstack endpoint create --region RegionOne \
+   volumev2 internal http://$CONTROLLERHN:8776/v2/%\(tenant_id\)s
+
+openstack endpoint create --region RegionOne \
+   volumev2 admin http://$CONTROLLERHN:8776/v2/%\(tenant_id\)s
+   sleep 1
+
+# manila
+openstack user create --domain default \
+   --password $SERVICE_PWD manila
+
+openstack role add --project service --user manila admin
+
+openstack service create --name manila \
+   --description "OpenStack Shared File Systems" share
+
+openstack service create --name manilav2 \
+   --description "OpenStack Shared File Systems" sharev2
+
+openstack endpoint create --region RegionOne \
+   share public http://$CONTROLLERHN:8786/v1/%\(tenant_id\)s
+
+openstack endpoint create --region RegionOne \
+   share internal http://$CONTROLLERHN:8786/v1/%\(tenant_id\)s
+
+openstack endpoint create --region RegionOne \
+   share admin http://$CONTROLLERHN:8786/v1/%\(tenant_id\)s
+
+openstack endpoint create --region RegionOne \
+   sharev2 public http://$CONTROLLERHN:8786/v2/%\(tenant_id\)s
+
+openstack endpoint create --region RegionOne \
+   sharev2 internal http://$CONTROLLERHN:8786/v2/%\(tenant_id\)s
+
+openstack endpoint create --region RegionOne \
+   sharev2 admin http://$CONTROLLERHN:8786/v2/%\(tenant_id\)s
+   sleep 1
+
+# swift
+openstack user create --domain default \
+   --password $SERVICE_PWD swift
+
+openstack role add --project service --user swift admin
+
+openstack service create --name swift \
+   --description "OpenStack Object Storage" object-store
+
+openstack endpoint create --region RegionOne \
+   object-store public http://$CONTROLLERHN:8080/v1/AUTH_%\(tenant_id\)s
+
+openstack endpoint create --region RegionOne \
+   object-store internal http://$CONTROLLERHN:8080/v1/AUTH_%\(tenant_id\)s
+
+openstack endpoint create --region RegionOne \
+   object-store admin http://$CONTROLLERHN:8080/v1
+   sleep 1
+
+# heat
+openstack user create --domain default \
+   --password $SERVICE_PWD heat
+
+openstack role add --project service --user heat admin
+
+openstack service create --name heat \
+   --description "Orchestration" orchestration
+
+openstack service create --name heat-cfn \
+   --description "Orchestration" cloudformation
+
+openstack endpoint create --region RegionOne \
+   orchestration public http://$CONTROLLERHN:8004/v1/%\(tenant_id\)s
+
+openstack endpoint create --region RegionOne \
+   orchestration internal http://$CONTROLLERHN:8004/v1/%\(tenant_id\)s
+
+openstack endpoint create --region RegionOne \
+   orchestration admin http://$CONTROLLERHN:8004/v1/%\(tenant_id\)s
+
+openstack endpoint create --region RegionOne \
+   cloudformation public http://$CONTROLLERHN:8000/v1
+
+openstack endpoint create --region RegionOne \
+   cloudformation internal http://$CONTROLLERHN:8000/v1
+
+openstack endpoint create --region RegionOne \
+   cloudformation admin http://$CONTROLLERHN:8000/v1
+
+openstack domain create --description "Stack projects and users" heat
+openstack user create --domain heat --password $SERVICE_PWD heat_domain_admin
+openstack role add --domain heat --user heat_domain_admin admin
+openstack role create heat_stack_owner
+openstack role add --project $FIRSTTENANT --user $FIRSTTENANT heat_stack_owner
+openstack role create heat_stack_user
+   sleep 1
+
+# telemetry
+openstack user create --domain default \
+   --password $SERVICE_PWD ceilometer
+
+openstack role add --project service --user ceilometer admin
+
+openstack service create --name ceilometer \
+   --description "Telemetry" metering
+
+openstack endpoint create --region RegionOne \
+   metering public http://$CONTROLLERHN:8777
+
+openstack endpoint create --region RegionOne \
+   metering internal http://$CONTROLLERHN:8777
+
+openstack endpoint create --region RegionOne \
+   metering admin http://$CONTROLLERHN:8777
+
+openstack role create ResellerAdmin
+openstack role add --project service --user ceilometer ResellerAdmin
+sleep 1
+
+# alarming
+openstack user create --domain default \
+   --password $SERVICE_PWD aodh
+
+openstack role add --project service --user aodh admin
+
+openstack service create --name aodh \
+   --description "Telemetry" alarming
+
+openstack endpoint create --region RegionOne \
+   alarming public http://$CONTROLLERHN:8042
+
+openstack endpoint create --region RegionOne \
+   alarming internal http://$CONTROLLERHN:8042
+
+openstack endpoint create --region RegionOne \
+   alarming admin http://$CONTROLLERHN:8042
+   sleep 1
+
+# +------------------------------------------+
+# | OPENRC SCRIPTS                           |
+# +------------------------------------------+
+unset OS_TOKEN
+unset OS_URL
+unset OS_IDENTITY_API_VERSION
+
+echo "export OS_PROJECT_DOMAIN_NAME=default" > admin-openrc.sh
+echo "export OS_USER_DOMAIN_NAME=default" >> admin-openrc.sh
+echo "export OS_PROJECT_NAME=admin" >> admin-openrc.sh
+echo "export OS_USERNAME=admin" >> admin-openrc.sh
+echo "export OS_PASSWORD=$ADMIN_PWD" >> admin-openrc.sh
+echo "export OS_AUTH_URL=http://$CONTROLLER:35357/v3" >> admin-openrc.sh
+echo "export OS_IDENTITY_API_VERSION=3" >> admin-openrc.sh
+
+echo "export OS_PROJECT_DOMAIN_NAME=default" > $FIRSTTENANT-openrc.sh
+echo "export OS_USER_DOMAIN_NAME=default" >> $FIRSTTENANT-openrc.sh
+echo "export OS_PROJECT_NAME=$FIRSTTENANT" >> $FIRSTTENANT-openrc.sh
+echo "export OS_USERNAME=$FIRSTTENANT" >> $FIRSTTENANT-openrc.sh
+echo "export OS_PASSWORD=$FIRSTTENPWD" >> $FIRSTTENANT-openrc.sh
+echo "export OS_AUTH_URL=http://$CONTROLLER:5000/v3" >> $FIRSTTENANT-openrc.sh
+echo "export OS_IDENTITY_API_VERSION=3" >> $FIRSTTENANT-openrc.sh
+
+echo "export OS_IMAGE_API_VERSION=2" >> admin-openrc.sh
+echo "export OS_IMAGE_API_VERSION=2" >> $FIRSTTENANT-openrc.sh
+
+file=/usr/share/keystone/keystone-dist-paste.ini
+
+crudini --set $file pipeline:public_api pipeline "sizelimit url_normalize request_id build_auth_context token_auth json_body ec2_extension user_crud_extension public_service"
+crudini --set $file pipeline:admin_api pipeline "sizelimit url_normalize request_id build_auth_context token_auth json_body ec2_extension s3_extension crud_extension admin_service"
+crudini --set $file pipeline:api_v3 pipeline "sizelimit url_normalize request_id build_auth_context token_auth json_body ec2_extension_v3 s3_extension simple_cert_extension revoke_extension federation_extension oauth1_extension endpoint_filter_extension service_v3"
+
+source admin-openrc.sh
+
+# +------------------------------------------+
+# | GLANCE                                   |
+# +------------------------------------------+
+tput setaf 2
+echo "<<< Glance >>>"
+tput setaf 7
+mysql -u root -p${DBPASS} <<EOF
+CREATE DATABASE glance;
+GRANT ALL PRIVILEGES ON glance.* TO 'glance'@'localhost' IDENTIFIED BY '$SERVICE_PWD';
+GRANT ALL PRIVILEGES ON glance.* TO 'glance'@'%' IDENTIFIED BY '$SERVICE_PWD';
+GRANT ALL PRIVILEGES ON glance.* TO 'glance'@'${CONTROLLERHN}' IDENTIFIED BY '$SERVICE_PWD';
+GRANT ALL PRIVILEGES ON glance.* TO 'glance'@'${CONTROLLER}' IDENTIFIED BY '$SERVICE_PWD';
+FLUSH PRIVILEGES;
+EOF
+
+# /etc/glance/glance-api.conf
+file=/etc/glance/glance-api.conf
+
+crudini --set $file database connection mysql+pymysql://glance:$SERVICE_PWD@$CONTROLLERHN/glance
+
+crudini --del $file keystone_authtoken
+crudini --set $file keystone_authtoken auth_uri http://$CONTROLLERHN:5000
+crudini --set $file keystone_authtoken auth_url http://$CONTROLLERHN:35357
+crudini --set $file keystone_authtoken memcached_servers $CONTROLLERHN:11211
+crudini --set $file keystone_authtoken auth_type password
+crudini --set $file keystone_authtoken project_domain_name default
+crudini --set $file keystone_authtoken user_domain_name default
+crudini --set $file keystone_authtoken project_name service
+crudini --set $file keystone_authtoken username glance
+crudini --set $file keystone_authtoken password $SERVICE_PWD
+
+crudini --set $file paste_deploy flavor keystone
+
+crudini --set $file glance_store stores file,http
+crudini --set $file glance_store default_store file
+crudini --set $file glance_store filesystem_store_datadir /var/lib/glance/images/
+
+# /etc/glance/glance-registry.conf
+file=/etc/glance/glance-registry.conf
+
+crudini --set $file database connection mysql+pymysql://glance:$SERVICE_PWD@$CONTROLLERHN/glance
+
+crudini --del $file keystone_authtoken
+crudini --set $file keystone_authtoken auth_uri http://$CONTROLLERHN:5000
+crudini --set $file keystone_authtoken auth_url http://$CONTROLLERHN:35357
+crudini --set $file keystone_authtoken memcached_servers $CONTROLLERHN:11211
+crudini --set $file keystone_authtoken auth_type password
+crudini --set $file keystone_authtoken project_domain_name default
+crudini --set $file keystone_authtoken user_domain_name default
+crudini --set $file keystone_authtoken project_name service
+crudini --set $file keystone_authtoken username glance
+crudini --set $file keystone_authtoken password $SERVICE_PWD
+
+crudini --set $file paste_deploy flavor keystone
+
+# update database
+su -s /bin/sh -c "glance-manage db_sync" glance
+
+# restart services
+for svc in api registry ; do
+   systemctl enable openstack-glance-$svc
+   systemctl restart openstack-glance-$svc
+done
+
+# +------------------------------------------+
+# | IMAGE UPLOAD                             |
+# +------------------------------------------+
+tput setaf 2
+echo "<<< Cirros >>>"
+tput setaf 7
+
+source admin-openrc.sh
+
+wget http://download.cirros-cloud.net/0.3.4/cirros-0.3.4-x86_64-disk.img
+sleep 5
+
+openstack image create \
+   "cirros-0.3.4-x86_64" \
+   --file cirros-0.3.4-x86_64-disk.img \
+   --disk-format qcow2 \
+   --container-format bare \
+   --public > /dev/null 2>&1
+
+rm -f cirros-0.3.4-x86_64-disk.img
+openstack image list
+
+# +------------------------------------------+
+# | COMPUTE                                  |
+# +------------------------------------------+
+tput setaf 2
+echo "<<< Compute >>>"
+tput setaf 7
+
+mysql -u root -p${DBPASS} <<EOF
+CREATE DATABASE nova_api;
+CREATE DATABASE nova;
+GRANT ALL PRIVILEGES ON nova.* TO 'nova'@'localhost' IDENTIFIED BY '$SERVICE_PWD';
+GRANT ALL PRIVILEGES ON nova.* TO 'nova'@'%' IDENTIFIED BY '$SERVICE_PWD';
+GRANT ALL PRIVILEGES ON nova.* TO 'nova'@'${CONTROLLERHN}' IDENTIFIED BY '$SERVICE_PWD';
+GRANT ALL PRIVILEGES ON nova_api.* TO 'nova'@'localhost' IDENTIFIED BY '$SERVICE_PWD';
+GRANT ALL PRIVILEGES ON nova_api.* TO 'nova'@'%' IDENTIFIED BY '$SERVICE_PWD';
+GRANT ALL PRIVILEGES ON nova_api.* TO 'nova'@'${CONTROLLERHN}' IDENTIFIED BY '$SERVICE_PWD';
+GRANT ALL PRIVILEGES ON nova_api.* TO 'nova'@'${CONTROLLER}' IDENTIFIED BY '$SERVICE_PWD';
+GRANT ALL PRIVILEGES ON nova.* TO 'nova'@'${CONTROLLER}' IDENTIFIED BY '$SERVICE_PWD';
+FLUSH PRIVILEGES;
+EOF
+
+# configuration
+file=/etc/nova/nova.conf
+
+crudini --set $file DEFAULT enabled_apis osapi_compute,metadata
+
+crudini --set $file api_database connection mysql+pymysql://nova:$SERVICE_PWD@$CONTROLLERHN/nova_api
+crudini --set $file database connection mysql+pymysql://nova:$SERVICE_PWD@$CONTROLLERHN/nova
+
+crudini --set $file DEFAULT rpc_backend rabbit
+
+crudini --set $file oslo_messaging_rabbit rabbit_host $CONTROLLERHN
+crudini --set $file oslo_messaging_rabbit rabbit_userid openstack
+crudini --set $file oslo_messaging_rabbit rabbit_password ${RABBIT_PASS}
+
+crudini --set $file DEFAULT auth_strategy keystone
+
+crudini --del $file keystone_authtoken
+crudini --set $file keystone_authtoken auth_uri http://$CONTROLLERHN:5000
+crudini --set $file keystone_authtoken auth_url http://$CONTROLLERHN:35357
+crudini --set $file keystone_authtoken memcached_servers $CONTROLLERHN:11211
+crudini --set $file keystone_authtoken auth_type password
+crudini --set $file keystone_authtoken project_domain_name default
+crudini --set $file keystone_authtoken user_domain_name default
+crudini --set $file keystone_authtoken project_name service
+crudini --set $file keystone_authtoken username nova
+crudini --set $file keystone_authtoken password $SERVICE_PWD
+
+crudini --set $file DEFAULT my_ip $CONTROLLER
+crudini --set $file DEFAULT use_neutron True
+crudini --set $file DEFAULT firewall_driver nova.virt.firewall.NoopFirewallDriver
+
+crudini --set $file vnc vncserver_listen $CONTROLLER
+crudini --set $file vnc vncserver_proxyclient_address $CONTROLLER
+
+crudini --set $file glance api_servers http://$CONTROLLERHN:9292
+
+crudini --set $file oslo_concurrency lock_path /var/lib/nova/tmp
+
+crudini --set $file neutron url http://$CONTROLLERHN:9696
+crudini --set $file neutron auth_url http://$CONTROLLERHN:35357
+crudini --set $file neutron auth_type password
+crudini --set $file neutron project_domain_name default
+crudini --set $file neutron user_domain_name default
+crudini --set $file neutron region_name RegionOne
+crudini --set $file neutron project_name service
+crudini --set $file neutron username neutron
+crudini --set $file neutron password $SERVICE_PWD
+
+crudini --set $file neutron service_metadata_proxy True
+crudini --set $file neutron metadata_proxy_shared_secret $META_PWD
+
+su -s /bin/sh -c "nova-manage api_db sync" nova
+su -s /bin/sh -c "nova-manage db sync" nova
+
+for svc in api consoleauth scheduler conductor novncproxy ; do
+   systemctl enable openstack-nova-$svc
+   systemctl restart openstack-nova-$svc
+done
+
+# +------------------------------------------+
+# | NEUTRON                                  |
+# +------------------------------------------+
+tput setaf 2
+echo "<<< Neutron >>>"
+tput setaf 7
+
+mysql -u root -p${DBPASS} <<EOF
+CREATE DATABASE neutron;
+GRANT ALL PRIVILEGES ON neutron.* TO 'neutron'@'localhost' IDENTIFIED BY '$SERVICE_PWD';
+GRANT ALL PRIVILEGES ON neutron.* TO 'neutron'@'%' IDENTIFIED BY '$SERVICE_PWD';
+GRANT ALL PRIVILEGES ON neutron.* TO 'neutron'@'${CONTROLLERHN}' IDENTIFIED BY '$SERVICE_PWD';
+GRANT ALL PRIVILEGES ON neutron.* TO 'neutron'@'${CONTROLLER}' IDENTIFIED BY '$SERVICE_PWD';
+FLUSH PRIVILEGES;
+EOF
+
+# /etc/neutron/neutron.conf
+file=/etc/neutron/neutron.conf
+
+crudini --set $file database connection mysql+pymysql://neutron:$SERVICE_PWD@$CONTROLLERHN/neutron
+
+crudini --set $file DEFAULT core_plugin ml2
+crudini --set $file DEFAULT service_plugins router
+crudini --set $file DEFAULT allow_overlapping_ips True
+
+crudini --set $file DEFAULT rpc_backend rabbit
+
+crudini --set $file oslo_messaging_rabbit rabbit_host $CONTROLLERHN
+crudini --set $file oslo_messaging_rabbit rabbit_userid openstack
+crudini --set $file oslo_messaging_rabbit rabbit_password ${RABBIT_PASS}
+
+crudini --set $file DEFAULT auth_strategy keystone
+
+crudini --del $file keystone_authtoken
+crudini --set $file keystone_authtoken auth_uri http://$CONTROLLERHN:5000
+crudini --set $file keystone_authtoken auth_url http://$CONTROLLERHN:35357
+crudini --set $file keystone_authtoken memcached_servers $CONTROLLERHN:11211
+crudini --set $file keystone_authtoken auth_type password
+crudini --set $file keystone_authtoken project_domain_name default
+crudini --set $file keystone_authtoken user_domain_name default
+crudini --set $file keystone_authtoken project_name service
+crudini --set $file keystone_authtoken username neutron
+crudini --set $file keystone_authtoken password $SERVICE_PWD
+
+crudini --set $file DEFAULT notify_nova_on_port_status_changes True
+crudini --set $file DEFAULT notify_nova_on_port_data_changes True
+
+crudini --set $file nova auth_url http://$CONTROLLERHN:35357
+crudini --set $file nova auth_type password
+crudini --set $file nova project_domain_name default
+crudini --set $file nova user_domain_name default
+crudini --set $file nova region_name RegionOne
+crudini --set $file nova project_name service
+crudini --set $file nova username nova
+crudini --set $file nova password $SERVICE_PWD
+
+crudini --set $file oslo_concurrency lock_path /var/lib/neutron/tmp
+
+# /etc/neutron/plugins/ml2/ml2_conf.ini
+file=/etc/neutron/plugins/ml2/ml2_conf.ini
+
+crudini --set $file ml2 type_drivers flat,vxlan
+crudini --set $file ml2 tenant_network_types vxlan
+crudini --set $file ml2 mechanism_drivers openvswitch
+
+crudini --set $file securitygroup enable_security_group True
+crudini --set $file securitygroup firewall_driver neutron.agent.linux.iptables_firewall.OVSHybridIptablesFirewallDriver
+crudini --set $file securitygroup enable_ipset True
+
+crudini --set $file ml2_type_vxlan vni_ranges 1:1000
+
+crudini --set $file ovs local_ip $CONTROLLERTUN
+crudini --set $file ovs enable_tunneling True
+crudini --set $file ovs bridge_mappings external:br-ex
+
+crudini --set $file agent tunnel_types vxlan
+
+crudini --set $CFILE ml2 extension_drivers port_security
+
+# /etc/nova/nova.conf
+file=/etc/nova/nova.conf
+crudini --set $file DEFAULT network_api_class nova.network.neutronv2.api.API
+crudini --set $file DEFAULT security_group_api neutron
+crudini --set $file DEFAULT linuxnet_interface_driver nova.network.linux_net.LinuxOVSInterfaceDriver
+crudini --set $file DEFAULT firewall_driver nova.virt.firewall.NoopFirewallDriver
+
+crudini --set $file neutron url http://$CONTROLLERHN:9696
+crudini --set $file neutron admin_auth_url http://$CONTROLLERHN:35357/v2.0
+crudini --set $file neutron admin_tenant_name service
+crudini --set $file neutron admin_username neutron
+crudini --set $file neutron admin_password $SERVICE_PWD
+
+crudini --set $file neutron service_metadata_proxy True
+crudini --set $file neutron metadata_proxy_shared_secret $META_PWD
+
+# finalise
+ln -s /etc/neutron/plugins/ml2/ml2_conf.ini /etc/neutron/plugin.ini
+
+su -s /bin/sh -c "neutron-db-manage --config-file /etc/neutron/neutron.conf \
+  --config-file /etc/neutron/plugins/ml2/ml2_conf.ini upgrade head" neutron
+
+for svc in api scheduler conductor ; do
+   systemctl restart openstack-nova-$svc
+done
+
+for svc in server ; do
+   systemctl enable neutron-$svc
+   systemctl restart neutron-$svc
+done
+
+# +------------------------------------------+
+# | HORIZON                                  |
+# +------------------------------------------+
+tput setaf 2
+echo "<<< Horizon >>>"
+tput setaf 7
+file=/etc/openstack-dashboard/local_settings
+cp $file $file.orig
+
+sed -i 's/OPENSTACK_HOST = "127.0.0.1"/OPENSTACK_HOST = "'"$CONTROLLERHN"'"/' $file
+
+sed -i "s/ALLOWED_HOSTS = \['horizon.example.com', 'localhost'\]/ALLOWED_HOSTS = ['*', ]/" $file
+
+echo "SESSION_ENGINE = 'django.contrib.sessions.backends.cache'" >> $file
+echo >> $file
+
+sed -i "/\django.core.cache.backends.locmem.LocMemCache/a \
+\        'LOCATION\': \'"$CONTROLLERHN":11211\'," $file
+
+sed -i "s/'django.core.cache.backends.locmem.LocMemCache'/'django.core.cache.backends.memcached.MemcachedCache'/" $file
+
+sed -i "s/^OPENSTACK_KEYSTONE_URL/#OPENSTACK_KEYSTONE_URL/" $file
+echo "OPENSTACK_KEYSTONE_URL = \"http://%s:5000/v3\" % OPENSTACK_HOST" >> $file
+echo >> $file
+
+echo "OPENSTACK_KEYSTONE_DEFAULT_DOMAIN = \"default\"" >> $file
+echo >> $file
+
+echo "OPENSTACK_KEYSTONE_MULTIDOMAIN_SUPPORT = True" >> $file
+echo >> $file
+
+sed -i 's/OPENSTACK_KEYSTONE_DEFAULT_ROLE = \"_member_\"/OPENSTACK_KEYSTONE_DEFAULT_ROLE = \"user\"/' $file
+
+sed -i 's/UTC/'$TIMEZONE'/' $file
+
+echo "OPENSTACK_API_VERSIONS = {" >> $file
+echo "    \"identity\": 3," >> $file
+echo "    \"image\": 2," >> $file
+echo "    \"volume\": 2," >> $file
+echo "}" >> $file
+echo >> $file
+
+# branding
+IMGDIR=/usr/share/openstack-dashboard/openstack_dashboard/static/dashboard/img/
+mv *.png $IMGDIR
+mv $IMGDIR/logo-splash.png $IMGDIR/logo-splash.png.orig
+cp $IMGDIR/frontpage.png $IMGDIR/logo-splash.png
+mv $IMGDIR/logo.png $IMGDIR/logo.png.orig
+cp $IMGDIR/small.png $IMGDIR/logo.png
+
+mv $IMGDIR/favicon.ico $IMGDIR/favicon.ico.orig
+mv *.ico $IMGDIR
+
+echo "SITE_BRANDING = \"Hopper~Stack\"" >> /usr/share/openstack-dashboard/openstack_dashboard/local/local_settings.py
+echo "SITE_BRANDING_LINK = \"http://www.hopper-stack.co.uk\"" >> /usr/share/openstack-dashboard/openstack_dashboard/local/local_settings.py
+
+setsebool -P httpd_can_network_connect on
+chown -R apache:apache /usr/share/openstack-dashboard/static
+
+for svc in httpd memcached ; do
+   systemctl restart $svc
+done
+
+# +------------------------------------------+
+# | CINDER                                   |
+# +------------------------------------------+
+tput setaf 2
+echo "<<< Cinder >>>"
+tput setaf 7
+
+mysql -u root -p${DBPASS} <<EOF
+CREATE DATABASE cinder;
+GRANT ALL PRIVILEGES ON cinder.* TO 'cinder'@'localhost' IDENTIFIED BY '$SERVICE_PWD';
+GRANT ALL PRIVILEGES ON cinder.* TO 'cinder'@'%' IDENTIFIED BY '$SERVICE_PWD';
+GRANT ALL PRIVILEGES ON cinder.* TO 'cinder'@'${CONTROLLERHN}' IDENTIFIED BY '$SERVICE_PWD';
+GRANT ALL PRIVILEGES ON cinder.* TO 'cinder'@'${CONTROLLER}' IDENTIFIED BY '$SERVICE_PWD';
+FLUSH PRIVILEGES;
+EOF
+
+# /etc/cinder/cinder.conf
+file=/etc/cinder/cinder.conf
+
+crudini --set $file database connection mysql+pymysql://cinder:$SERVICE_PWD@$CONTROLLERHN/cinder
+
+crudini --set $file DEFAULT rpc_backend rabbit
+
+crudini --set $file oslo_messaging_rabbit rabbit_host $CONTROLLERHN
+crudini --set $file oslo_messaging_rabbit rabbit_userid openstack
+crudini --set $file oslo_messaging_rabbit rabbit_password ${RABBIT_PASS}
+
+crudini --set $file DEFAULT auth_strategy keystone
+
+crudini --del $file keystone_authtoken
+crudini --set $file keystone_authtoken auth_uri http://$CONTROLLERHN:5000
+crudini --set $file keystone_authtoken auth_url http://$CONTROLLERHN:35357
+crudini --set $file keystone_authtoken memcached_servers $CONTROLLERHN:11211
+crudini --set $file keystone_authtoken auth_type password
+crudini --set $file keystone_authtoken project_domain_name default
+crudini --set $file keystone_authtoken user_domain_name default
+crudini --set $file keystone_authtoken project_name service
+crudini --set $file keystone_authtoken username cinder
+crudini --set $file keystone_authtoken password $SERVICE_PWD
+
+crudini --set $file DEFAULT my_ip $CONTROLLER
+
+crudini --set $file oslo_concurrency lock_path /var/lib/cinder/tmp
+
+su -s /bin/sh -c "cinder-manage db sync" cinder
+
+# /etc/nova/nova.conf
+file=/etc/nova/nova.conf
+
+crudini --set $file cinder os_region_name RegionOne
+
+systemctl restart openstack-nova-api.service
+
+for svc in api scheduler ; do
+   systemctl enable openstack-cinder-$svc
+   systemctl restart openstack-cinder-$svc
+done
+
+# +------------------------------------------+
+# | MANILA                                   |
+# +------------------------------------------+
+tput setaf 2
+echo "<<< Manila >>>"
+tput setaf 7
+
+mysql -u root -p${DBPASS} <<EOF
+CREATE DATABASE manila;
+GRANT ALL PRIVILEGES ON manila.* TO 'manila'@'localhost' IDENTIFIED BY '$SERVICE_PWD';
+GRANT ALL PRIVILEGES ON manila.* TO 'manila'@'%' IDENTIFIED BY '$SERVICE_PWD';
+GRANT ALL PRIVILEGES ON manila.* TO 'manila'@'${CONTROLLERHN}' IDENTIFIED BY '$SERVICE_PWD';
+GRANT ALL PRIVILEGES ON manila.* TO 'manila'@'${CONTROLLER}' IDENTIFIED BY '$SERVICE_PWD';
+FLUSH PRIVILEGES;
+EOF
+
+file=/etc/manila/manila.conf
+
+crudini --set $file database connection mysql+pymysql://manila:$SERVICE_PWD@$CONTROLLERHN/manila
+
+crudini --set $file DEFAULT rpc_backend rabbit
+
+crudini --set $file oslo_messaging_rabbit rabbit_host $CONTROLLERHN
+crudini --set $file oslo_messaging_rabbit rabbit_userid openstack
+crudini --set $file oslo_messaging_rabbit rabbit_password ${RABBIT_PASS}
+
+crudini --set $file DEFAULT default_share_type default_share_type
+crudini --set $file DEFAULT rootwrap_config /etc/manila/rootwrap.conf
+
+crudini --set $file DEFAULT auth_strategy keystone
+
+crudini --del $file keystone_authtoken
+crudini --set $file keystone_authtoken memcached_servers $CONTROLLERHN:11211
+crudini --set $file keystone_authtoken auth_uri http://$CONTROLLERHN:5000
+crudini --set $file keystone_authtoken auth_url http://$CONTROLLERHN:35357
+crudini --set $file keystone_authtoken auth_type password
+crudini --set $file keystone_authtoken project_domain_name default
+crudini --set $file keystone_authtoken user_domain_name default
+crudini --set $file keystone_authtoken project_name service
+crudini --set $file keystone_authtoken username manila
+crudini --set $file keystone_authtoken password $SERVICE_PWD
+
+crudini --set $file DEFAULT my_ip $CONTROLLER
+
+crudini --set $file oslo_concurrency lock_path /var/lib/manila/tmp
+
+su -s /bin/sh -c "manila-manage db sync" manila
+
+for svc in api scheduler ; do
+   systemctl enable openstack-manila-$svc
+   systemctl restart openstack-manila-$svc
+done
+
+# +------------------------------------------+
+# | SWIFT                                    |
+# +------------------------------------------+
+tput setaf 2
+echo "<<< Swift >>>"
+tput setaf 7
+
+mysql -u root -p${DBPASS} <<EOF
+CREATE DATABASE swift;
+GRANT ALL PRIVILEGES ON swift.* TO 'swift'@'localhost' IDENTIFIED BY '$SERVICE_PWD';
+GRANT ALL PRIVILEGES ON swift.* TO 'swift'@'%' IDENTIFIED BY '$SERVICE_PWD';
+GRANT ALL PRIVILEGES ON swift.* TO 'swift'@'${CONTROLLERHN}' IDENTIFIED BY '$SERVICE_PWD';
+GRANT ALL PRIVILEGES ON swift.* TO 'swift'@'${CONTROLLER}' IDENTIFIED BY '$SERVICE_PWD';
+FLUSH PRIVILEGES;
+EOF
+
+curl -o /etc/swift/proxy-server.conf https://git.openstack.org/cgit/openstack/swift/plain/etc/proxy-server.conf-sample?h=stable/$RELEASE
+
+# /etc/swift/proxy-server.conf
+file=/etc/swift/proxy-server.conf
+
+crudini --set $file DEFAULT bind_port 8080
+crudini --set $file DEFAULT user swift
+crudini --set $file DEFAULT swift_dir /etc/swift
+
+crudini --set $file pipeline:main pipeline "catch_errors gatekeeper healthcheck proxy-logging cache container_sync bulk ratelimit authtoken keystoneauth container-quotas account-quotas slo dlo versioned_writes proxy-logging proxy-server"
+
+crudini --set $file app:proxy-server use egg:swift#proxy
+crudini --set $file app:proxy-server account_autocreate true
+
+crudini --set $file filter:keystoneauth use egg:swift#keystoneauth
+crudini --set $file filter:keystoneauth operator_roles admin,user
+
+crudini --del $file filter:authtoken
+crudini --set $file filter:authtoken paste.filter_factory keystonemiddleware.auth_token:filter_factory
+crudini --set $file filter:authtoken auth_uri http://$CONTROLLERHN:5000
+crudini --set $file filter:authtoken auth_url http://$CONTROLLERHN:35357
+crudini --set $file filter:authtoken memcached_servers $CONTROLLERHN:11211
+crudini --set $file filter:authtoken auth_type password
+crudini --set $file filter:authtoken project_domain_name default
+crudini --set $file filter:authtoken user_domain_name default
+crudini --set $file filter:authtoken project_name service
+crudini --set $file filter:authtoken username swift
+crudini --set $file filter:authtoken password $SERVICE_PWD
+crudini --set $file filter:authtoken delay_auth_decision true
+
+crudini --set $file filter:cache use egg:swift#memcache
+crudini --set $file filter:cache memcache_servers $CONTROLLERHN:11211
+
+# +------------------------------------------+
+# | HEAT                                     |
+# +------------------------------------------+
+tput setaf 2
+echo "<<< Heat >>>"
+tput setaf 7
+mysql -u root -p${DBPASS} <<EOF
+CREATE DATABASE heat;
+GRANT ALL PRIVILEGES ON heat.* TO 'heat'@'localhost' IDENTIFIED BY '$SERVICE_PWD';
+GRANT ALL PRIVILEGES ON heat.* TO 'heat'@'%' IDENTIFIED BY '$SERVICE_PWD';
+GRANT ALL PRIVILEGES ON heat.* TO 'heat'@'${CONTROLLERHN}' IDENTIFIED BY '$SERVICE_PWD';
+GRANT ALL PRIVILEGES ON heat.* TO 'heat'@'${CONTROLLER}' IDENTIFIED BY '$SERVICE_PWD';
+FLUSH PRIVILEGES;
+EOF
+
+# /etc/heat/heat.conf
+file=/etc/heat/heat.conf
+
+crudini --set $file database connection mysql+pymysql://heat:$SERVICE_PWD@$CONTROLLERHN/heat
+
+crudini --set $file DEFAULT rpc_backend rabbit
+
+crudini --set $file oslo_messaging_rabbit rabbit_host $CONTROLLERHN
+crudini --set $file oslo_messaging_rabbit rabbit_userid openstack
+crudini --set $file oslo_messaging_rabbit rabbit_password ${RABBIT_PASS}
+
+crudini --del $file keystone_authtoken
+crudini --set $file keystone_authtoken auth_uri http://$CONTROLLERHN:5000
+crudini --set $file keystone_authtoken auth_url http://$CONTROLLERHN:35357
+crudini --set $file keystone_authtoken memcached_servers $CONTROLLERHN:11211
+crudini --set $file keystone_authtoken auth_type password
+crudini --set $file keystone_authtoken project_domain_name default
+crudini --set $file keystone_authtoken user_domain_name default
+crudini --set $file keystone_authtoken project_name service
+crudini --set $file keystone_authtoken username heat
+crudini --set $file keystone_authtoken password $SERVICE_PWD
+
+crudini --set $file trustee auth_plugin password
+crudini --set $file trustee auth_url http://$CONTROLLERHN:35357
+crudini --set $file trustee username heat
+crudini --set $file trustee password $SERVICE_PWD
+crudini --set $file trustee user_domain_name default
+
+crudini --set $file clients_keystone auth_uri http://$CONTROLLERHN:35357
+
+crudini --set $file ec2authtoken auth_uri http://$CONTROLLERHN:5000
+
+crudini --set $file DEFAULT heat_metadata_server_url http://$CONTROLLERHN:8000
+crudini --set $file DEFAULT heat_waitcondition_server_url http://$CONTROLLERHN:8000/v1/waitcondition
+
+crudini --set $file DEFAULT stack_domain_admin heat_domain_admin
+crudini --set $file DEFAULT stack_domain_admin_password $SERVICE_PWD
+crudini --set $file DEFAULT stack_user_domain_name heat
+
+su -s /bin/sh -c "heat-manage db_sync" heat
+
+# restart services
+for svc in api api-cfn engine ; do
+   systemctl enable openstack-heat-$svc
+   systemctl restart openstack-heat-$svc
+done
+
+# +------------------------------------------+
+# | TELEMETRY                                |
+# +------------------------------------------+
+tput setaf 2
+echo "<<< Telemetry >>>"
+tput setaf 7
+
+mysql -u root -p${DBPASS} <<EOF
+CREATE DATABASE ceilometer;
+GRANT ALL PRIVILEGES ON ceilometer.* TO 'ceilometer'@'localhost' IDENTIFIED BY '$SERVICE_PWD';
+GRANT ALL PRIVILEGES ON ceilometer.* TO 'ceilometer'@'%' IDENTIFIED BY '$SERVICE_PWD';
+GRANT ALL PRIVILEGES ON ceilometer.* TO 'ceilometer'@'${CONTROLLERHN}' IDENTIFIED BY '$SERVICE_PWD';
+GRANT ALL PRIVILEGES ON ceilometer.* TO 'ceilometer'@'${CONTROLLER}' IDENTIFIED BY '$SERVICE_PWD';
+FLUSH PRIVILEGES;
+EOF
+
+# /etc/ceilometer/ceilometer.conf
+file=/etc/ceilometer/ceilometer.conf
+
+crudini --set $file database connection mysql+pymysql://ceilometer:$SERVICE_PWD@$CONTROLLERHN/ceilometer?charset=utf8
+
+crudini --set $file DEFAULT rpc_backend rabbit
+
+crudini --set $file oslo_messaging_rabbit rabbit_host $CONTROLLERHN
+crudini --set $file oslo_messaging_rabbit rabbit_userid openstack
+crudini --set $file oslo_messaging_rabbit rabbit_password ${RABBIT_PASS}
+
+crudini --set $file DEFAULT auth_strategy keystone
+
+crudini --del $file keystone_authtoken
+crudini --set $file keystone_authtoken auth_uri http://$CONTROLLERHN:5000
+crudini --set $file keystone_authtoken auth_url http://$CONTROLLERHN:35357
+crudini --set $file keystone_authtoken memcached_servers $CONTROLLERHN:11211
+crudini --set $file keystone_authtoken auth_type password
+crudini --set $file keystone_authtoken project_domain_name default
+crudini --set $file keystone_authtoken user_domain_name default
+crudini --set $file keystone_authtoken project_name service
+crudini --set $file keystone_authtoken username ceilometer
+crudini --set $file keystone_authtoken password $SERVICE_PWD
+
+crudini --set $file service_credentials auth_type password
+crudini --set $file service_credentials auth_url http://$CONTROLLERHN:5000/v3
+crudini --set $file service_credentials project_domain_name default
+crudini --set $file service_credentials user_domain_name default
+crudini --set $file service_credentials project_name service
+crudini --set $file service_credentials username ceilometer
+crudini --set $file service_credentials password $SERVICE_PWD
+crudini --set $file service_credentials interface internalURL
+crudini --set $file service_credentials region_name RegionOne
+
+file=/etc/httpd/conf.d/wsgi-ceilometer.conf
+echo "Listen 8777" >> $file
+echo "" >> $file
+echo "<VirtualHost *:8777>" >> $file
+echo "    WSGIDaemonProcess ceilometer-api processes=2 threads=10 user=ceilometer group=ceilometer display-name=%{GROUP}" >> $file
+echo "    WSGIProcessGroup ceilometer-api" >> $file
+echo "    WSGIScriptAlias / "/var/www/cgi-bin/ceilometer/app"" >> $file
+echo "    WSGIApplicationGroup %{GLOBAL}" >> $file
+echo "    ErrorLog /var/log/httpd/ceilometer_error.log" >> $file
+echo "    CustomLog /var/log/httpd/ceilometer_access.log combined" >> $file
+echo "</VirtualHost>" >> $file
+echo "" >> $file
+echo "WSGISocketPrefix /var/run/httpd" >> $file
+
+# database
+ceilometer-dbsync --config-file /etc/ceilometer/ceilometer.conf
+
+# reload http
+systemctl reload httpd.service
+
+# services
+for svc in notification central collector ; do
+   systemctl enable openstack-ceilometer-$svc
+   systemctl restart openstack-ceilometer-$svc
+done
+
+# glance
+file=/etc/glance/glance-api.conf
+crudini --set $file DEFAULT rpc_backend rabbit
+crudini --set $file oslo_messaging_rabbit rabbit_host $CONTROLLERHN
+crudini --set $file oslo_messaging_rabbit rabbit_userid openstack
+crudini --set $file oslo_messaging_rabbit rabbit_password ${RABBIT_PASS}
+
+crudini --set $file oslo_messaging_notifications driver messagingv2
+
+file=/etc/glance/glance-registry.conf
+crudini --set $file DEFAULT rpc_backend rabbit
+crudini --set $file oslo_messaging_rabbit rabbit_host $CONTROLLERHN
+crudini --set $file oslo_messaging_rabbit rabbit_userid openstack
+crudini --set $file oslo_messaging_rabbit rabbit_password ${RABBIT_PASS}
+
+crudini --set $file oslo_messaging_notifications driver messagingv2
+
+for svc in api registry ; do
+   systemctl restart openstack-glance-$svc
+done
+
+# cinder
+file=/etc/cinder/cinder.conf
+
+crudini --set $file oslo_messaging_notifications driver messagingv2
+
+for svc in api scheduler ; do
+   systemctl restart openstack-cinder-$svc
+done
+
+# swift
+file=/etc/swift/proxy-server.conf
+
+crudini --set $file filter:keystoneauth operator_roles "admin, user, ResellerAdmin"
+
+crudini --set $file pipeline:main pipeline "ceilometer catch_errors gatekeeper healthcheck proxy-logging cache container_sync bulk ratelimit authtoken keystoneauth container-quotas account-quotas slo dlo versioned_writes proxy-logging proxy-server"
+
+crudini --set $file filter:ceilometer paste.filter_factory ceilometermiddleware.swift:filter_factory
+crudini --set $file filter:ceilometer control_exchange swift
+crudini --set $file filter:ceilometer url rabbit://openstack:${RABBIT_PASS}@${CONTROLLERHN}:5672/
+crudini --set $file filter:ceilometer driver messagingv2
+crudini --set $file filter:ceilometer topic notifications
+crudini --set $file filter:ceilometer log_level WARN
+
+systemctl restart openstack-swift-proxy.service
+
+# +------------------------------------------+
+# | ALARMING                                 |
+# +------------------------------------------+
+tput setaf 2
+echo "<<< Alarming >>>"
+tput setaf 7
+
+mysql -u root -p${DBPASS} <<EOF
+CREATE DATABASE aodh;
+GRANT ALL PRIVILEGES ON aodh.* TO 'aodh'@'localhost' IDENTIFIED BY '$SERVICE_PWD';
+GRANT ALL PRIVILEGES ON aodh.* TO 'aodh'@'%' IDENTIFIED BY '$SERVICE_PWD';
+GRANT ALL PRIVILEGES ON aodh.* TO 'aodh'@'${CONTROLLERHN}' IDENTIFIED BY '$SERVICE_PWD';
+GRANT ALL PRIVILEGES ON aodh.* TO 'aodh'@'${CONTROLLER}' IDENTIFIED BY '$SERVICE_PWD';
+FLUSH PRIVILEGES;
+EOF
+
+file=/etc/aodh/aodh.conf
+
+crudini --set $file database connection mysql+pymysql://aodh:$SERVICE_PWD@$CONTROLLERHN/aodh?charset=utf8
+
+crudini --set $file DEFAULT rpc_backend rabbit
+
+crudini --set $file oslo_messaging_rabbit rabbit_host $CONTROLLERHN
+crudini --set $file oslo_messaging_rabbit rabbit_userid openstack
+crudini --set $file oslo_messaging_rabbit rabbit_password ${RABBIT_PASS}
+
+crudini --set $file DEFAULT auth_strategy keystone
+
+crudini --del $file keystone_authtoken
+crudini --set $file keystone_authtoken auth_uri http://$CONTROLLERHN:5000
+crudini --set $file keystone_authtoken auth_url http://$CONTROLLERHN:35357
+crudini --set $file keystone_authtoken memcached_servers $CONTROLLERHN:11211
+crudini --set $file keystone_authtoken auth_type password
+crudini --set $file keystone_authtoken project_domain_name default
+crudini --set $file keystone_authtoken user_domain_name default
+crudini --set $file keystone_authtoken project_name service
+crudini --set $file keystone_authtoken username aodh
+crudini --set $file keystone_authtoken password $SERVICE_PWD
+
+crudini --set $file service_credentials auth_type password
+crudini --set $file service_credentials auth_url http://$CONTROLLERHN:5000/v3
+crudini --set $file service_credentials project_domain_name default
+crudini --set $file service_credentials user_domain_name default
+crudini --set $file service_credentials project_name service
+crudini --set $file service_credentials username aodh
+crudini --set $file service_credentials password $SERVICE_PWD
+crudini --set $file service_credentials interface internalURL
+crudini --set $file service_credentials region_name RegionOne
+
+su -s /bin/sh -c "aodh-dbsync" aodh
+
+for svc in api evaluator notifier listener ; do
+   systemctl enable openstack-aodh-$svc
+   systemctl restart openstack-aodh-$svc
+done
+
+# +------------------------------------------+
+# | SERVICE RESTART                          |
+# +------------------------------------------+
+systemctl restart httpd.service
+systemctl restart memcached.service
+
+# +------------------------------------------+
+# | FLAVORS                                  |
+# +------------------------------------------+
+source admin-openrc.sh
+cat variables | grep ^FLAVOR | sed "s/FLAVOR/nova flavor-create/" \
+| sed "s/=\"/ /" | cut -d\" -f1  > /tmp/flavorlist
+source /tmp/flavorlist
+

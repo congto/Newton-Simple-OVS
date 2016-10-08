@@ -1,0 +1,114 @@
+:<<'hopper-stack-notice'
+
+Copyright 2016 Hopper-Stack
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+hopper-stack-notice
+
+tput setaf 2
+echo "<<< Variables >>>"
+tput setaf 7
+
+# +------------------------------------------+
+# | VARIABLES                                |
+# +------------------------------------------+
+
+RELEASE=newton
+
+DBPASS=mariadbpass
+RABBIT_PASS=rabbitpass
+SERVICE_PWD=servicepass
+ADMIN_TOKEN=adminpass
+ADMIN_PWD=admin
+FIRSTTENPWD=demo
+FIRSTTENANT=demo
+META_PWD=metapassword
+NTPSERVER=pool.ntp.org
+
+CONTROLLER=192.168.100.200
+CONTROLLERHN=controller
+
+COMPUTE=192.168.100.201
+COMPUTEHN=compute1
+COMPUTETUN=192.168.11.201
+# LinuxBridges only
+COMPUTEEXT=eth2
+
+# COMPUTE=192.168.100.206
+# COMPUTEHN=compute2
+# COMPUTETUN=192.168.11.206
+# LinuxBridges only
+# COMPUTEEXT=eth2
+
+# COMPUTE=192.168.100.207
+# COMPUTEHN=compute3
+# COMPUTETUN=192.168.11.207
+# LinuxBridges only
+# COMPUTEEXT=eth2
+
+BLOCK=192.168.100.202
+BLOCKHN=block
+
+OBJECT1=192.168.100.203
+OBJECT1HN=object1
+
+OBJECT2=192.168.100.204
+OBJECT2HN=object2
+
+# OVS Only
+NETWORK=192.168.100.205
+NETWORKHN=network
+NETWORKTUN=192.168.11.205
+NETWORKEXT=eth2
+
+PUBLIC_NETWORK=192.168.10.0
+PUBLIC_START=192.168.10.101
+PUBLIC_END=192.168.10.120
+PUBLIC_GW=192.168.10.3
+
+OBJECT_DISKS="vdb vdc vdd"
+CINDER_DISKS="vdb vdc vdd"
+
+# escape any forward slashes
+TIMEZONE="Europe\/London"
+
+# Combined object1-block and object2-network on same node
+THREE_NODE=True
+
+# +------------------------------------------+
+# | UPDATE HOSTS                             |
+# +------------------------------------------+
+CHK=`cat /etc/hosts | grep -w $CONTROLLER | awk '{print $1}'`
+if [ x$CHK == x ]; then
+   echo "$CONTROLLER            $CONTROLLERHN" >> /etc/hosts
+   echo "$COMPUTE               $COMPUTEHN" >> /etc/hosts
+   echo "$OBJECT1               $OBJECT1HN" >> /etc/hosts
+   echo "$OBJECT2               $OBJECT2HN" >> /etc/hosts
+   if [ x$THREE_NODE != xTrue ]; then
+       echo "$BLOCK                 $BLOCKHN" >> /etc/hosts
+       echo "$NETWORK               $NETWORKHN" >> /etc/hosts
+   fi
+fi
+
+FLAVOR="a1.tiny   05 1024   1 1"
+FLAVOR="a2.tiny   06 1024   5 1"
+FLAVOR="s1.small  10 1024  40 1"
+FLAVOR="s2.small  11 2048  40 1"
+FLAVOR="m1.medium 20 4096  40 2"
+FLAVOR="m2.medium 21 8192  80 4"
+FLAVOR="c3.large  50 4096  40 4"
+FLAVOR="c4.xlarge 51 8192  80 8"
+FLAVOR="m3.large  60 8192  40 2"
+FLAVOR="m4.xlarge 61 16384 80 4"
+

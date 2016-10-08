@@ -1,0 +1,264 @@
+#!/bin/bash
+
+:<<'hopper-stack-notice'
+
+Copyright 2016 Hopper-Stack
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+hopper-stack-notice
+
+# +------------------------------------------+
+# | VARIABLES                                |
+# +------------------------------------------+
+source variables
+
+# +------------------------------------------+
+# | PACKAGES                                 |
+# +------------------------------------------+
+tput setaf 2
+echo "<<< Packages >>>"
+tput setaf 7
+
+yum install -y http://rdo.fedorapeople.org/openstack-$RELEASE/rdo-release-$RELEASE.rpm
+yum install -y centos-release-openstack-$RELEASE
+
+yum install -y crudini
+yum install -y openstack-nova-compute
+
+yum install -y openstack-neutron
+yum install -y openstack-neutron-ml2
+yum install -y openstack-neutron-openvswitch
+
+yum install -y openstack-ceilometer-compute
+yum install -y python-ceilometerclient
+yum install -y python-pecan
+
+# +------------------------------------------+
+# | INITIALISE                               |
+# +------------------------------------------+
+# security
+systemctl mask firewalld
+systemctl stop firewalld
+sed -i 's/enforcing/disabled/g' /etc/selinux/config
+echo 0 > /sys/fs/selinux/enforce
+
+# ntp
+yum install -y chrony
+cd /etc
+sed -i "s/^server/# server/g" chrony.conf
+echo "server $NTPSERVER iburst" >> chrony.conf
+systemctl enable chronyd.service
+systemctl restart chronyd.service
+chronyc sources
+cd
+
+# +------------------------------------------+
+# | COMPUTE                                  |
+# +------------------------------------------+
+file=/etc/nova/nova.conf
+
+crudini --set $file DEFAULT rpc_backend rabbit
+crudini --set $file DEFAULT enabled_apis osapi_compute,metadata
+
+crudini --set $file oslo_messaging_rabbit rabbit_host $CONTROLLERHN
+crudini --set $file oslo_messaging_rabbit rabbit_userid openstack
+crudini --set $file oslo_messaging_rabbit rabbit_password ${RABBIT_PASS}
+
+crudini --set $file DEFAULT auth_strategy keystone
+
+crudini --del $file keystone_authtoken
+crudini --set $file keystone_authtoken auth_uri http://$CONTROLLERHN:5000
+crudini --set $file keystone_authtoken auth_url http://$CONTROLLERHN:35357
+crudini --set $file keystone_authtoken memcached_servers $CONTROLLERHN:11211
+crudini --set $file keystone_authtoken auth_type password
+crudini --set $file keystone_authtoken project_domain_name default
+crudini --set $file keystone_authtoken user_domain_name default
+crudini --set $file keystone_authtoken project_name service
+crudini --set $file keystone_authtoken username nova
+crudini --set $file keystone_authtoken password $SERVICE_PWD
+
+crudini --set $file DEFAULT my_ip $COMPUTE
+crudini --set $file DEFAULT use_neutron True
+crudini --set $file DEFAULT firewall_driver nova.virt.firewall.NoopFirewallDriver
+
+crudini --set $file vnc enabled True
+crudini --set $file vnc vncserver_listen 0.0.0.0
+crudini --set $file vnc vncserver_proxyclient_address $COMPUTE
+crudini --set $file vnc novncproxy_base_url http://$CONTROLLERHN:6080/vnc_auto.html
+
+crudini --set $file glance api_servers http://$CONTROLLERHN:9292
+
+crudini --set $file oslo_concurrency lock_path /var/lib/nova/tmp
+
+crudini --set $file libvirt virt_type qemu
+
+for svc in libvirtd openstack-nova-compute ; do
+   systemctl enable $svc
+   systemctl restart $svc
+done
+
+# +------------------------------------------+
+# | NEUTRON                                  |
+# +------------------------------------------+
+echo "Neutron"
+
+# /etc/neutron/neutron.conf
+file=/etc/neutron/neutron.conf
+
+crudini --set $file DEFAULT rpc_backend rabbit
+crudini --set $file oslo_messaging_rabbit rabbit_host $CONTROLLERHN
+crudini --set $file oslo_messaging_rabbit rabbit_userid openstack
+crudini --set $file oslo_messaging_rabbit rabbit_password ${RABBIT_PASS}
+
+crudini --set $file DEFAULT auth_strategy keystone
+
+crudini --del $file keystone_authtoken
+crudini --set $file keystone_authtoken auth_uri http://$CONTROLLERHN:5000
+crudini --set $file keystone_authtoken auth_url http://$CONTROLLERHN:35357
+crudini --set $file keystone_authtoken memcached_servers $CONTROLLERHN:11211
+crudini --set $file keystone_authtoken auth_type password
+crudini --set $file keystone_authtoken project_domain_name default
+crudini --set $file keystone_authtoken user_domain_name default
+crudini --set $file keystone_authtoken project_name service
+crudini --set $file keystone_authtoken username neutron
+crudini --set $file keystone_authtoken password $SERVICE_PWD
+
+crudini --set $file DEFAULT core_plugin ml2
+crudini --set $file DEFAULT service_plugins router
+crudini --set $file DEFAULT allow_overlapping_ips True
+
+# /etc/neutron/plugins/ml2/ml2_conf.ini
+file=/etc/neutron/plugins/ml2/ml2_conf.ini
+
+crudini --set $file ml2 type_drivers flat,vxlan
+crudini --set $file ml2 tenant_network_types vxlan
+crudini --set $file ml2 mechanism_drivers openvswitch
+
+crudini --set $file ml2_type_vxlan vni_ranges 1:1000
+
+crudini --set $file securitygroup firewall_driver neutron.agent.linux.iptables_firewall.OVSHybridIptablesFirewallDriver
+crudini --set $file securitygroup enable_security_group True
+crudini --set $file securitygroup enable_ipset True
+
+crudini --set $file ovs local_ip $COMPUTETUN
+crudini --set $file ovs enable_tunneling True
+
+crudini --set $file agent tunnel_types vxlan
+
+# /etc/neutron/plugins/ml2/openvswitch_agent.ini
+file=/etc/neutron/plugins/ml2/openvswitch_agent.ini
+
+crudini --set $file ovs integration_bridge br-int
+crudini --set $file ovs tunnel_bridge br-tun
+crudini --set $file ovs local_ip $COMPUTETUN
+crudini --set $file ovs enable_tunneling True
+crudini --set $file ovs int_peer_patch_port patch-tun
+crudini --set $file ovs tun_peer_patch_port patch-int
+
+crudini --set $file securitygroup firewall_driver neutron.agent.linux.iptables_firewall.OVSHybridIptablesFirewallDriver
+crudini --set $file securitygroup enable_security_group True
+crudini --set $file securitygroup enable_ipset True
+
+crudini --set $file agent tunnel_types vxlan
+
+systemctl enable openvswitch.service
+systemctl restart openvswitch.service
+
+# /etc/nova/nova.conf
+file=/etc/nova/nova.conf
+crudini --set $file DEFAULT network_api_class nova.network.neutronv2.api.API
+crudini --set $file DEFAULT security_group_api neutron
+crudini --set $file DEFAULT linuxnet_interface_driver nova.network.linux_net.LinuxOVSInterfaceDriver
+crudini --set $file DEFAULT firewall_driver nova.virt.firewall.NoopFirewallDriver
+
+crudini --set $file neutron url http://$CONTROLLERHN:9696
+crudini --set $file neutron auth_url http://$CONTROLLERHN:35357
+crudini --set $file neutron auth_type password
+crudini --set $file neutron project_domain_name default
+crudini --set $file neutron user_domain_name default
+crudini --set $file neutron region_name RegionOne
+crudini --set $file neutron project_name service
+crudini --set $file neutron username neutron
+crudini --set $file neutron password $SERVICE_PWD
+
+crudini --set $file neutron service_metadata_proxy True
+crudini --set $file neutron metadata_proxy_shared_secret $META_PWD
+
+# services
+ln -s /etc/neutron/plugins/ml2/ml2_conf.ini /etc/neutron/plugin.ini
+
+for svc in nova-compute ; do
+   systemctl enable openstack-$svc
+   systemctl restart openstack-$svc
+done
+
+for svc in openvswitch-agent ; do
+   systemctl enable neutron-$svc
+   systemctl start neutron-$svc
+done
+
+# +------------------------------------------+
+# | TELEMETRY                                |
+# +------------------------------------------+
+file=/etc/ceilometer/ceilometer.conf
+
+crudini --set $file publisher telemetry_secret dastardly
+
+crudini --set $file DEFAULT rpc_backend rabbit
+crudini --set $file DEFAULT auth_strategy keystone
+
+crudini --set $file oslo_messaging_rabbit rabbit_hosts $CONTROLLERHN:5672
+crudini --set $file oslo_messaging_rabbit rabbit_userid openstack
+crudini --set $file oslo_messaging_rabbit rabbit_password ${RABBIT_PASS}
+
+crudini --del $file keystone_authtoken
+crudini --set $file keystone_authtoken auth_uri http://$CONTROLLERHN:5000
+crudini --set $file keystone_authtoken auth_url http://$CONTROLLERHN:35357
+crudini --set $file keystone_authtoken memcached_servers $CONTROLLERHN:11211
+crudini --set $file keystone_authtoken auth_type password
+crudini --set $file keystone_authtoken project_domain_name default
+crudini --set $file keystone_authtoken user_domain_name default
+crudini --set $file keystone_authtoken project_name service
+crudini --set $file keystone_authtoken username ceilometer
+crudini --set $file keystone_authtoken password $SERVICE_PWD
+
+crudini --set $file service_credentials auth_url http://$CONTROLLERHN:5000
+crudini --set $file service_credentials project_domain_id default
+crudini --set $file service_credentials user_domain_id default
+crudini --set $file service_credentials auth_type password
+crudini --set $file service_credentials username ceilometer
+crudini --set $file service_credentials project_name service
+crudini --set $file service_credentials password $SERVICE_PWD
+crudini --set $file service_credentials interface internalURL
+crudini --set $file service_credentials region_name RegionOne
+
+# /etc/nova/nova.conf
+file=/etc/nova/nova.conf
+crudini --set $file DEFAULT instance_usage_audit True
+crudini --set $file DEFAULT instance_usage_audit_period hour
+crudini --set $file DEFAULT notify_on_state_change vm_and_task_state
+crudini --set $file oslo_messaging_notifications driver messagingv2
+
+# restart services
+systemctl enable openstack-ceilometer-compute.service
+systemctl restart openstack-ceilometer-compute.service
+systemctl restart openstack-nova-compute.service
+
+# +------------------------------------------+
+# | NOVA RESTART                             |
+# +------------------------------------------+
+for svc in libvirtd openstack-nova-compute ; do
+   systemctl restart $svc
+done
+

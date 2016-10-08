@@ -1,0 +1,255 @@
+#!/bin/bash
+
+:<<'hopper-stack-notice'
+
+Copyright 2016 Hopper-Stack
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+hopper-stack-notice
+
+# +------------------------------------------+
+# | VARIABLES                                |
+# +------------------------------------------+
+source variables
+
+# +------------------------------------------+
+# | PACKAGES                                 |
+# +------------------------------------------+
+tput setaf 2
+echo "<<< Packages >>>"
+tput setaf 7
+
+yum install -y http://rdo.fedorapeople.org/openstack-$RELEASE/rdo-release-$RELEASE.rpm
+yum install -y centos-release-openstack-$RELEASE
+
+yum install -y xfsprogs rsync
+yum install -y openstack-swift-account
+yum install -y openstack-swift-container
+yum install -y openstack-swift-object
+yum install -y crudini
+
+yum install -y python-ceilometermiddleware
+
+# +------------------------------------------+
+# | INITIAL                                  |
+# +------------------------------------------+
+# security
+systemctl mask firewalld
+systemctl stop firewalld
+sed -i 's/enforcing/disabled/g' /etc/selinux/config
+echo 0 > /sys/fs/selinux/enforce
+
+# ntp
+yum install -y chrony
+cd /etc
+sed -i "s/^server/# server/g" chrony.conf
+echo "server $NTPSERVER iburst" >> chrony.conf
+systemctl enable chronyd.service
+systemctl restart chronyd.service
+chronyc sources
+cd
+
+# +------------------------------------------+
+# | DISKS                                    |
+# +------------------------------------------+
+for i in ${OBJECT_DISKS[@]}; do
+   mkfs.xfs /dev/$i
+   mkdir -p /srv/node/$i
+   echo "/dev/$i /srv/node/$i xfs noatime,nodiratime,nobarrier,logbufs=8 0 2" >> /etc/fstab
+   mount /srv/node/$i
+done
+
+IP=`hostname -I`
+file=/etc/rsyncd.conf
+
+crudini --set $file "" uid swift
+crudini --set $file "" gid swift
+crudini --set $file "" "log file" /var/log/rsyncd.log
+crudini --set $file "" "pid file" /var/run/rsyncd.pid
+crudini --set $file "" address $IP
+
+crudini --set $file account "max connections" 2
+crudini --set $file account path /srv/node/
+crudini --set $file account "read only" false
+crudini --set $file account "lock file" /var/lock/account.lock
+
+crudini --set $file container "max connections" 2
+crudini --set $file container path /srv/node/
+crudini --set $file container "read only" false
+crudini --set $file container "lock file" /var/lock/container.lock
+
+crudini --set $file object "max connections" 2
+crudini --set $file object path /srv/node/
+crudini --set $file object "read only" false
+crudini --set $file object "lock file" /var/lock/object.lock
+
+sed -i.bak "/ConditionPathExists/a \
+After=network.target" /usr/lib/systemd/system/rsyncd.service
+
+# restart services
+for svc in rsyncd ; do
+   systemctl enable $svc
+   systemctl restart $svc
+done
+
+# +------------------------------------------+
+# | SWIFT                                    |
+# +------------------------------------------+
+curl -o /etc/swift/account-server.conf https://git.openstack.org/cgit/openstack/swift/plain/etc/account-server.conf-sample?h=stable/$RELEASE
+curl -o /etc/swift/container-server.conf https://git.openstack.org/cgit/openstack/swift/plain/etc/container-server.conf-sample?h=stable/$RELEASE
+curl -o /etc/swift/object-server.conf https://git.openstack.org/cgit/openstack/swift/plain/etc/object-server.conf-sample?h=stable/$RELEASE
+curl -o /etc/swift/swift.conf \
+https://git.openstack.org/cgit/openstack/swift/plain/etc/swift.conf-sample?h=stable/$RELEASE
+
+# /etc/swift/account-server.conf
+file=/etc/swift/account-server.conf
+
+crudini --set $file DEFAULT bind_ip 0.0.0.0
+crudini --set $file DEFAULT bind_port 6002
+crudini --set $file DEFAULT user swift
+crudini --set $file DEFAULT swift_dir /etc/swift
+crudini --set $file DEFAULT devices /srv/node
+crudini --set $file DEFAULT mount_check True
+
+crudini --set $file pipeline:main pipeline "healthcheck recon account-server"
+
+crudini --set $file filter:recon use egg:swift#recon
+crudini --set $file filter:recon recon_cache_path /var/cache/swift
+
+# /etc/swift/container-server.conf
+file=/etc/swift/container-server.conf
+
+crudini --set $file DEFAULT bind_ip 0.0.0.0
+crudini --set $file DEFAULT bind_port 6001
+crudini --set $file DEFAULT user swift
+crudini --set $file DEFAULT swift_dir /etc/swift
+crudini --set $file DEFAULT devices /srv/node
+crudini --set $file DEFAULT mount_check True
+
+crudini --set $file pipeline:main pipeline "healthcheck recon container-server"
+
+crudini --set $file filter:recon use egg:swift#recon
+crudini --set $file filter:recon recon_cache_path /var/cache/swift
+
+#  /etc/swift/object-server.conf
+file=/etc/swift/object-server.conf
+
+crudini --set $file DEFAULT bind_ip 0.0.0.0
+crudini --set $file DEFAULT bind_port 6000
+crudini --set $file DEFAULT user swift
+crudini --set $file DEFAULT swift_dir /etc/swift
+crudini --set $file DEFAULT devices /srv/node
+crudini --set $file DEFAULT mount_check True
+
+crudini --set $file pipeline:main pipeline "healthcheck recon object-server"
+
+crudini --set $file filter:recon use egg:swift#recon
+crudini --set $file filter:recon recon_cache_path /var/cache/swift
+crudini --set $file filter:recon recon_lock_path /var/lock
+
+# /etc/swift/swift.conf
+file=/etc/swift/swift.conf
+
+crudini --set $file swift-hash swift_hash_path_suffix 6568990
+crudini --set $file swift-hash swift_hash_path_prefix 9823442
+
+crudini --set $file storage-policy:0 name Policy-0
+crudini --set $file storage-policy:0 default yes
+
+# change swift file permissions
+chown -R swift:swift /srv/node
+mkdir -p /var/cache/swift
+chown -R swift:swift /var/cache/swift
+chown -R swift:swift /etc/swift
+
+# start services on storage node
+for service in openstack-swift-account-auditor openstack-swift-account-reaper openstack-swift-account-replicator openstack-swift-account openstack-swift-container-auditor openstack-swift-container-replicator openstack-swift-container-updater openstack-swift-container openstack-swift-object-auditor openstack-swift-object-replicator openstack-swift-object-updater openstack-swift-object
+do
+   systemctl enable $service
+   systemctl restart $service
+done
+
+# +------------------------------------------+
+# | RING BUILDER                             |
+# +------------------------------------------+
+HN=`hostname`
+NODES="$OBJECT1HN $OBJECT2HN"
+
+if [ x$HN == x$OBJECT2HN ]; then
+   cd /etc/swift
+
+   # create the rings on last node
+   swift-ring-builder account.builder create 10 3 1
+   swift-ring-builder container.builder create 10 3 1
+   swift-ring-builder object.builder create 10 3 1
+
+   count=1
+   for j in ${NODES[@]}; do
+      for i in ${OBJECT_DISKS[@]}; do
+         swift-ring-builder account.builder add --region 1 --zone $count --ip $j --port 6002 --device $i --weight 100
+         swift-ring-builder account.builder
+         let count=count+1
+
+         swift-ring-builder container.builder add --region 1 --zone $count --ip $j --port 6001 --device $i --weight 100
+         swift-ring-builder container.builder
+         let count=count+1
+
+         swift-ring-builder object.builder add --region 1 --zone $count --ip $j --port 6000 --device $i --weight 100
+         swift-ring-builder object.builder
+         let count=count+1
+      done
+   done
+
+   swift-ring-builder account.builder rebalance
+   swift-ring-builder container.builder rebalance
+   swift-ring-builder object.builder rebalance
+
+   chown -R root:swift /etc/swift
+
+   mkdir -p /tmp/tmpdir
+   cd /etc/swift
+   cp swift.conf /tmp/tmpdir
+   cp account.ring.gz /tmp/tmpdir
+   cp container.ring.gz /tmp/tmpdir
+   cp object.ring.gz /tmp/tmpdir
+
+   echo "" > /tmp/tmp.lis
+
+   for service in account-auditor account-reaper account-replicator account container-auditor container-replicator container-updater container object-auditor object-replicator object-updater object
+   do
+      echo "systemctl enable openstack-swift-$service" >> /tmp/tmp.lis
+      echo "systemctl restart openstack-swift-$service" >> /tmp/tmp.lis
+   done
+
+   cd /tmp/tmpdir
+   scp * $CONTROLLER:/etc/swift
+   scp * $OBJECT1:/etc/swift
+
+   chmod 755 /tmp/tmp.lis
+   /tmp/tmp.lis
+
+   ssh $CONTROLLER 'chown -R root:swift /etc/swift; systemctl enable openstack-swift-proxy.service memcached.service; systemctl restart openstack-swift-proxy.service memcached.service'
+
+   scp /tmp/tmp.lis $OBJECT1:/tmp
+   ssh $OBJECT1 'chown -R root:swift /etc/swift; chmod 755 /tmp/tmp.lis; /tmp/tmp.lis'
+
+   rm -rf /tmp/tmpdir
+fi
+
+echo
+echo "       Reboot controller node after object2 has rebooted"
+echo
+
+reboot
+

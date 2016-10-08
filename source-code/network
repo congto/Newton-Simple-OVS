@@ -1,0 +1,192 @@
+#!/bin/bash
+
+:<<'hopper-stack-notice'
+
+Copyright 2016 Hopper-Stack
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+hopper-stack-notice
+
+# +------------------------------------------+
+# | VARIABLES                                |
+# +------------------------------------------+
+source variables
+
+# +------------------------------------------+
+# | INITIAL                                  |
+# +------------------------------------------+
+tput setaf 2
+echo "<<< Initial >>>"
+tput setaf 7
+
+systemctl mask firewalld
+systemctl stop firewalld
+sed -i 's/enforcing/disabled/g' /etc/selinux/config
+echo 0 > /sys/fs/selinux/enforce
+
+# ntp
+yum install -y chrony
+cd /etc
+sed -i "s/^server/# server/g" chrony.conf
+echo "server $NTPSERVER iburst" >> chrony.conf
+systemctl enable chronyd.service
+systemctl restart chronyd.service
+chronyc sources
+cd
+
+# +------------------------------------------+
+# | PACKAGES                                 |
+# +------------------------------------------+
+tput setaf 2
+echo "<<< Packages >>>"
+tput setaf 7
+
+yum install -y http://rdo.fedorapeople.org/openstack-$RELEASE/rdo-release-$RELEASE.rpm
+yum install -y centos-release-openstack-$RELEASE
+
+yum install -y python-openstackclient
+yum install -y crudini
+
+yum install -y openstack-neutron
+yum install -y openstack-neutron-ml2 
+yum install -y openstack-neutron-openvswitch
+
+# +------------------------------------------+
+# | NEUTRON                                  |
+# +------------------------------------------+
+tput setaf 2
+echo "<<< Neutron >>>"
+tput setaf 7
+
+# /etc/neutron/neutron.conf
+file=/etc/neutron/neutron.conf
+
+crudini --set $file DEFAULT core_plugin ml2
+crudini --set $file DEFAULT service_plugins router
+crudini --set $file DEFAULT allow_overlapping_ips True
+
+crudini --set $file DEFAULT rpc_backend rabbit
+
+crudini --set $file oslo_messaging_rabbit rabbit_host $CONTROLLERHN
+crudini --set $file oslo_messaging_rabbit rabbit_userid openstack
+crudini --set $file oslo_messaging_rabbit rabbit_password ${RABBIT_PASS}
+
+crudini --set $file DEFAULT auth_strategy keystone
+
+crudini --del $file keystone_authtoken
+crudini --set $file keystone_authtoken auth_uri http://$CONTROLLERHN:5000
+crudini --set $file keystone_authtoken auth_url http://$CONTROLLERHN:35357
+crudini --set $file keystone_authtoken memcached_servers $CONTROLLERHN:11211
+crudini --set $file keystone_authtoken auth_type password
+crudini --set $file keystone_authtoken project_domain_name default
+crudini --set $file keystone_authtoken user_domain_name default
+crudini --set $file keystone_authtoken project_name service
+crudini --set $file keystone_authtoken username neutron
+crudini --set $file keystone_authtoken password $SERVICE_PWD
+
+crudini --set $file oslo_concurrency lock_path /var/lib/neutron/tmp
+
+# /etc/neutron/plugins/ml2/ml2_conf.ini
+file=/etc/neutron/plugins/ml2/ml2_conf.ini
+
+crudini --set $file ml2 type_drivers flat,vxlan
+crudini --set $file ml2 tenant_network_types vxlan
+crudini --set $file ml2 mechanism_drivers openvswitch
+
+crudini --set $file ml2_type_flat flat_networks external
+
+crudini --set $file ml2_type_vxlan vni_ranges 1:1000
+
+crudini --set $file securitygroup enable_security_group True
+crudini --set $file securitygroup enable_ipset True
+crudini --set $file securitygroup firewall_driver neutron.agent.linux.iptables_firewall.OVSHybridIptablesFirewallDriver
+
+crudini --set $file ovs local_ip $NETWORKTUN
+crudini --set $file ovs bridge_mappings external:br-ex
+
+crudini --set $file agent tunnel_types vxlan
+
+# /etc/neutron/l3_agent.ini
+file=/etc/neutron/l3_agent.ini
+
+crudini --set $file DEFAULT interface_driver neutron.agent.linux.interface.OVSInterfaceDriver
+crudini --set $file DEFAULT external_network_bridge ""
+crudini --set $file DEFAULT router_delete_namespaces True
+crudini --set $file DEFAULT verbose True
+
+# /etc/neutron/dhcp_agent.ini
+file=/etc/neutron/dhcp_agent.ini
+
+crudini --set $file DEFAULT interface_driver neutron.agent.linux.interface.OVSInterfaceDriver
+crudini --set $file DEFAULT dhcp_driver neutron.agent.linux.dhcp.Dnsmasq
+crudini --set $file DEFAULT verbose True
+crudini --set $file DEFAULT enable_isolated_metadata True
+crudini --set $file DEFAULT enable_metadata_network True
+
+# /etc/neutron/dnsmasq-neutron.conf
+file=/etc/neutron/dnsmasq-neutron.conf
+echo "dhcp-option-force=26,1454" > $file
+crudini --set $file DEFAULT dnsmasq_config_file $file
+pkill dnsmasq
+
+# /etc/neutron/metadata_agent.ini
+file=/etc/neutron/metadata_agent.ini
+
+crudini --set $file DEFAULT nova_metadata_ip $CONTROLLERHN
+crudini --set $file DEFAULT metadata_proxy_shared_secret $META_PWD
+
+crudini --set $file DEFAULT auth_uri http://$CONTROLLERHN:5000
+crudini --set $file DEFAULT auth_url http://$CONTROLLERHN:35357
+crudini --set $file DEFAULT auth_region RegionOne
+crudini --set $file DEFAULT auth_plugin password
+crudini --set $file DEFAULT project_domain_id default
+crudini --set $file DEFAULT user_domain_id default
+crudini --set $file DEFAULT project_name service
+crudini --set $file DEFAULT username neutron
+crudini --set $file DEFAULT password $SERVICE_PWD
+
+# /etc/neutron/plugins/ml2/openvswitch_agent.ini
+file=/etc/neutron/plugins/ml2/openvswitch_agent.ini
+
+crudini --set $file ovs integration_bridge br-int
+crudini --set $file ovs tunnel_bridge br-tun
+crudini --set $file ovs local_ip $NETWORKTUN
+crudini --set $file ovs enable_tunneling True
+crudini --set $file ovs int_peer_patch_port patch-tun
+crudini --set $file ovs tun_peer_patch_port patch-int
+crudini --set $file ovs bridge_mappings external:br-ex
+
+crudini --set $file securitygroup firewall_driver neutron.agent.linux.iptables_firewall.OVSHybridIptablesFirewallDriver
+crudini --set $file securitygroup enable_security_group True
+crudini --set $file securitygroup enable_ipset True
+
+crudini --set $file agent tunnel_types vxlan
+
+# finalise
+systemctl enable openvswitch.service
+systemctl start openvswitch.service
+
+ovs-vsctl add-br br-ex
+ovs-vsctl add-port br-ex $NETWORKEXT
+ethtool -K $NETWORKEXT gro off
+
+ln -s /etc/neutron/plugins/ml2/ml2_conf.ini /etc/neutron/plugin.ini
+
+for svc in openvswitch-agent dhcp-agent metadata-agent l3-agent ; do
+   systemctl enable neutron-$svc
+   systemctl restart neutron-$svc
+done
+
+systemctl enable neutron-ovs-cleanup.service
+

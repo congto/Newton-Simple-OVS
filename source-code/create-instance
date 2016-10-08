@@ -1,0 +1,130 @@
+#!/bin/bash
+
+:<<'hopper-stack-notice'
+
+Copyright 2016 Hopper-Stack
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+hopper-stack-notice
+
+# +------------------------------------------+
+# | VARIABLES                                |
+# +------------------------------------------+
+source variables
+
+# keypair
+source $FIRSTTENANT-openrc.sh
+echo "/root/.ssh/id_rsa" > /tmp/yes
+ssh-keygen -q -N "" < /tmp/yes
+echo
+nova keypair-add --pub-key .ssh/id_rsa.pub ${FIRSTTENANT}-key
+sleep 1
+rm -rf /tmp/yes
+nova keypair-list
+sleep 1
+
+# security group
+source $FIRSTTENANT-openrc.sh
+openstack security group create \
+--description "$FIRSTTENANT security group" ${FIRSTTENANT}sg
+sleep 1
+openstack security group rule create --protocol icmp \
+--ingress --src-ip "0.0.0.0/0" ${FIRSTTENANT}sg
+sleep 1
+openstack security group rule create --protocol tcp \
+--ingress --dst-port 22 --src-ip "0.0.0.0/0" ${FIRSTTENANT}sg
+sleep 1
+openstack security group rule create --protocol tcp \
+--ingress --dst-port 80 --src-ip "0.0.0.0/0" ${FIRSTTENANT}sg
+sleep 1
+openstack security group rule create --protocol tcp \
+--ingress --dst-port 3389 --src-ip "0.0.0.0/0" ${FIRSTTENANT}sg
+sleep 1
+
+# provider network
+source admin-openrc.sh
+neutron net-create ext-net --shared --provider:physical_network external \
+  --provider:network_type flat
+
+# public subnet
+neutron subnet-create ext-net $PUBLIC_NETWORK/24 --name ext-subnet \
+  --allocation-pool start=$PUBLIC_START,end=$PUBLIC_END \
+  --dns-nameserver 8.8.8.8 --gateway $PUBLIC_GW
+
+# private network
+source $FIRSTTENANT-openrc.sh
+neutron net-create $FIRSTTENANT-net
+
+# private subnet
+neutron subnet-create $FIRSTTENANT-net 20.10.10.0/24 --name $FIRSTTENANT-subnet \
+  --dns-nameserver 8.8.8.8 --gateway 20.10.10.1
+
+# external router
+source admin-openrc.sh
+neutron net-update ext-net --router:external
+
+# project router 
+source $FIRSTTENANT-openrc.sh
+neutron router-create $FIRSTTENANT-router
+
+# add private network to router
+neutron router-interface-add $FIRSTTENANT-router $FIRSTTENANT-subnet
+
+# add public network to router
+neutron router-gateway-set $FIRSTTENANT-router ext-net
+
+# verity
+source admin-openrc.sh
+ip netns
+neutron router-port-list $FIRSTTENANT-router
+
+# nova quotas
+tenant=$(openstack project list | grep $FIRSTTENANT | awk '{print $2}')
+nova quota-update --instances 75 $tenant
+nova quota-update --cores 20 $tenant
+nova quota-update --ram 30720 $tenant
+nova quota-show --tenant $tenant
+
+# cinder quotas
+cinder quota-update --volumes 75 $tenant
+cinder quota-update --gigabytes 1000 $tenant
+cinder quota-update --snapshots 75 $tenant
+
+# neutron quotas
+neutron quota-update --tenant_id $tenant --floatingip 50
+
+# launch instance
+source $FIRSTTENANT-openrc.sh
+FLV=`nova flavor-list | grep a1.tiny | awk '{print $4}' | head -1`
+sleep 1
+IMG=`openstack image list | grep cirros | awk '{print $4}' | head -1`
+sleep 1
+NET=`neutron net-list | grep $FIRSTTENANT-net | awk '{print $2}' | head -1`
+
+nova boot --flavor $FLV --image $IMG --nic net-id=$NET \
+--security-group ${FIRSTTENANT}sg --key-name ${FIRSTTENANT}-key testserver
+sleep 1
+
+neutron floatingip-create ext-net > /tmp/fp.list
+cat /tmp/fp.list
+FIP=`cat /tmp/fp.list | grep floating_ip_address | awk '{print $4}'`
+rm -f /tmp/fp.list
+echo "waiting ..."
+nova floating-ip-associate testserver $FIP > /dev/null 2>&1
+
+source $FIRSTTENANT-openrc.sh
+echo "Console access:"
+echo "nova get-vnc-console testserver novnc"
+echo
+

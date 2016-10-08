@@ -1,0 +1,243 @@
+#!/bin/bash
+
+:<<'hopper-stack-notice'
+
+Copyright 2016 Hopper-Stack
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+hopper-stack-notice
+
+# +------------------------------------------+
+# | VARIABLES                                |
+# +------------------------------------------+
+source variables
+
+# +------------------------------------------+
+# | INITIAL                                  |
+# +------------------------------------------+
+systemctl mask firewalld
+systemctl stop firewalld
+sed -i 's/enforcing/disabled/g' /etc/selinux/config
+echo 0 > /sys/fs/selinux/enforce
+
+# ntp
+yum install -y chrony
+cd /etc
+sed -i "s/^server/# server/g" chrony.conf
+echo "server $NTPSERVER iburst" >> chrony.conf
+systemctl enable chronyd.service
+systemctl restart chronyd.service
+chronyc sources
+cd
+
+# +------------------------------------------+
+# | PACKAGES                                 |
+# +------------------------------------------+
+tput setaf 2
+echo "<<< Packages >>>"
+tput setaf 7
+
+yum install -y http://rdo.fedorapeople.org/openstack-$RELEASE/rdo-release-$RELEASE.rpm
+yum install -y centos-release-openstack-$RELEASE
+
+yum install -y crudini
+
+yum install -y chrony
+yum install -y lvm2
+
+yum install -y openstack-cinder
+yum install -y targetcli
+yum install -y python-keystone
+
+# manila
+yum install -y openstack-neutron
+yum install -y openstack-neutron-linuxbridge
+yum install -y ebtables
+yum install -y openstack-manila-share
+yum install -y python2-PyMySQL
+
+# +------------------------------------------+
+# | LVM                                      |
+# +------------------------------------------+
+for svc in lvm2-lvmetad ; do
+   systemctl enable $svc
+   systemctl start $svc
+done
+
+for i in ${CINDER_DISKS[@]}; do
+   pvcreate /dev/$i
+   DISKVOLS=$DISKVOLS" "/dev/$i
+done
+
+CHKVOL=`vgdisplay | grep cinder-volumes | awk '{print $3}'`
+if [ x$CHKVOL != x ]; then
+   vgremove cinder-volumes
+fi
+vgcreate cinder-volumes $DISKVOLS
+
+filstr="filter = [ "
+declare -a arr1=(`pvdisplay | grep "PV Name" | awk '{print $3}' | sed 's/[0-9]*//g'| cut -f3 -d/`)
+for i in ${arr1[@]}; do
+     newstr="\"a/$i/\", "
+     filstr=$filstr${newstr}
+done
+newstr="\"r/.*/\"]"
+filstr=$filstr${newstr}
+echo $filstr
+sed -i "/^devices {/a \
+${filstr}" /etc/lvm/lvm.conf
+
+# +------------------------------------------+
+# | CINDER                                   |
+# +------------------------------------------+
+file=/etc/cinder/cinder.conf
+
+crudini --set $file database connection mysql+pymysql://cinder:$SERVICE_PWD@$CONTROLLERHN/cinder
+
+crudini --set $file DEFAULT rpc_backend rabbit
+
+crudini --set $file oslo_messaging_rabbit rabbit_host $CONTROLLERHN
+crudini --set $file oslo_messaging_rabbit rabbit_userid openstack
+crudini --set $file oslo_messaging_rabbit rabbit_password ${RABBIT_PASS}
+
+crudini --set $file DEFAULT auth_strategy keystone
+
+crudini --del $file keystone_authtoken
+crudini --set $file keystone_authtoken auth_uri http://$CONTROLLERHN:5000
+crudini --set $file keystone_authtoken auth_url http://$CONTROLLERHN:35357
+crudini --set $file keystone_authtoken memcached_servers $CONTROLLERHN:11211
+crudini --set $file keystone_authtoken auth_type password
+crudini --set $file keystone_authtoken project_domain_name default
+crudini --set $file keystone_authtoken user_domain_name default
+crudini --set $file keystone_authtoken project_name service
+crudini --set $file keystone_authtoken username cinder
+crudini --set $file keystone_authtoken password $SERVICE_PWD
+
+crudini --set $file DEFAULT my_ip $BLOCK
+
+crudini --set $file lvm volume_driver cinder.volume.drivers.lvm.LVMVolumeDriver
+crudini --set $file lvm volume_group cinder-volumes
+crudini --set $file lvm iscsi_protocol iscsi
+crudini --set $file lvm iscsi_helper lioadm
+
+crudini --set $file DEFAULT enabled_backends lvm
+
+crudini --set $file DEFAULT glance_api_servers http://$CONTROLLERHN:9292
+
+crudini --set $file oslo_concurrency lock_path /var/lib/cinder/tmp
+
+# restart services
+for svc in openstack-cinder-volume target ; do
+   systemctl enable $svc
+   systemctl restart $svc
+done
+
+# +------------------------------------------+
+# | MANILA                                   |
+# +------------------------------------------+
+# share node
+file=/etc/manila/manila.conf
+
+crudini --set $file database connection mysql+pymysql://manila:$SERVICE_PWD@$CONTROLLERHN/manila
+
+crudini --set $file DEFAULT rpc_backend rabbit
+
+crudini --set $file oslo_messaging_rabbit rabbit_host $CONTROLLERHN
+crudini --set $file oslo_messaging_rabbit rabbit_userid openstack
+crudini --set $file oslo_messaging_rabbit rabbit_password ${RABBIT_PASS}
+
+crudini --set $file DEFAULT default_share_type default_share_type
+crudini --set $file DEFAULT rootwrap_config /etc/manila/rootwrap.conf
+
+crudini --set $file DEFAULT auth_strategy keystone
+
+crudini --del $file keystone_authtoken
+crudini --set $file keystone_authtoken memcached_servers $CONTROLLERHN:11211
+crudini --set $file keystone_authtoken auth_uri http://$CONTROLLERHN:5000
+crudini --set $file keystone_authtoken auth_url http://$CONTROLLERHN:35357
+crudini --set $file keystone_authtoken auth_type password
+crudini --set $file keystone_authtoken project_domain_name default
+crudini --set $file keystone_authtoken user_domain_name default
+crudini --set $file keystone_authtoken project_name service
+crudini --set $file keystone_authtoken username manila
+crudini --set $file keystone_authtoken password $SERVICE_PWD
+
+crudini --set $file DEFAULT my_ip $CONTROLLER
+
+crudini --set $file oslo_concurrency lock_path /var/lib/manila/tmp
+
+# Driver support
+file=/etc/manila/manila.conf
+
+crudini --set $file DEFAULT enabled_share_backends generic
+crudini --set $file DEFAULT enabled_share_protocols NFS,CIFS
+
+crudini --set $file neutron url http://$CONTROLLERHN:9696
+crudini --set $file neutron auth_uri http://$CONTROLLERHN:5000
+crudini --set $file neutron auth_url http://$CONTROLLERHN:35357
+crudini --set $file neutron memcached_servers $CONTROLLERHN:11211
+crudini --set $file neutron auth_type password
+crudini --set $file neutron project_domain_name default
+crudini --set $file neutron user_domain_name default
+crudini --set $file neutron region_name RegionOne
+crudini --set $file neutron project_name service
+crudini --set $file neutron username neutron
+crudini --set $file neutron password $SERVICE_PWD
+
+crudini --set $file nova auth_uri http://$CONTROLLERHN:5000
+crudini --set $file nova auth_url http://$CONTROLLERHN:35357
+crudini --set $file nova memcached_servers $CONTROLLERHN:11211
+crudini --set $file nova auth_type password
+crudini --set $file nova project_domain_name default
+crudini --set $file nova user_domain_name default
+crudini --set $file nova region_name RegionOne
+crudini --set $file nova project_name service
+crudini --set $file nova username nova
+crudini --set $file nova password $SERVICE_PWD
+
+crudini --set $file cinder auth_uri http://$CONTROLLERHN:5000
+crudini --set $file cinder auth_url http://$CONTROLLERHN:35357
+crudini --set $file cinder memcached_servers $CONTROLLERHN:11211
+crudini --set $file cinder auth_type password
+crudini --set $file cinder project_domain_name default
+crudini --set $file cinder user_domain_name default
+crudini --set $file cinder region_name RegionOne
+crudini --set $file cinder project_name service
+crudini --set $file cinder username cinder
+crudini --set $file cinder password $SERVICE_PWD
+
+crudini --set $file generic share_backend_name GENERIC
+crudini --set $file generic share_driver manila.share.drivers.generic.GenericShareDriver
+crudini --set $file generic driver_handles_share_servers True
+crudini --set $file generic service_instance_flavor_id 100
+crudini --set $file generic service_image_name manila-service-image
+crudini --set $file generic service_instance_user manila
+crudini --set $file generic service_instance_password manila
+crudini --set $file generic interface_driver manila.network.linux.interface.BridgeInterfaceDriver
+
+for svc in share ; do
+   systemctl enable openstack-manila-$svc
+   systemctl restart openstack-manila-$svc
+done
+
+# +------------------------------------------+
+# | TELEMETRY                                |
+# +------------------------------------------+
+file=/etc/cinder/cinder.conf
+crudini --set $file oslo_messaging_notifications driver messagingv2
+
+for svc in volume ; do
+   systemctl restart openstack-cinder-$svc
+done
+
